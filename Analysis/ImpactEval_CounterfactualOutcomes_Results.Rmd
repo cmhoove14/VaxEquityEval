@@ -1,0 +1,3427 @@
+---
+title: "Equity Allocation Outcomes Avoided Results"
+author: "Chris Hoover et al"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(splines)
+library(lme4)
+library(sandwich)
+library(msm)
+
+options(knitr.kable.NA = '',
+        scipen = 999) # prevent scientific notation in printing
+
+source(here::here("Analysis/01-Setup.R"))
+mods <- readRDS(here::here("data/best_mods.rds"))
+
+gc()
+```
+
+
+## Process/clean bootstrapped samples and other input data   
+
+```{r effect_est_boot_load_sims}
+its_boots <- readRDS("//mnt/projects/connect-izb/resources/health_equity/VaxEquityAllocationImpactEval/bootstrapped_outcomes_avoided_its10000.rds")
+#its_boots <- readRDS(here::here("data/bootstrapped_outcomes_avoided_its10000.rds"))
+```
+
+```{r effect_est_boot}
+its_boots <- its_boots %>% 
+  dplyr::select(-c(c_avd:d_avd)) %>% 
+  rename("c_avd" = c_avd_obs, "h_avd" = h_avd_obs, "d_avd" = d_avd_obs) %>% 
+  group_by(iter, county, vemquartile) %>% 
+  arrange(iter, county, vemquartile, date) %>% 
+  mutate(across(c_avd:d_avd, cumsum, .names = "cum_{.col}")) %>% 
+  ungroup()
+
+weekly_state_avd_sum <- its_boots %>% 
+  filter(date >= policy_date, date <= its_end_date) %>% 
+  group_by(date, iter, vemquartile) %>% 
+  summarise(across(c_avd:d_avd, sum)) %>% 
+  ungroup() %>% 
+  group_by(date, vemquartile) %>% 
+  summarise(across(c_avd:d_avd, 
+                   .fns = list(
+                     mn = mean,
+                     md = median,
+                     q025 = ~quantile(.x, 0.025),
+                     q25 = ~quantile(.x, 0.25),
+                     q75 = ~quantile(.x, 0.75),
+                     q975 = ~quantile(.x, 0.975)
+                   )))
+
+# Summary time series of cumulative outcomes avoided in VEM Q1 zips by county
+its_boots_cnty_date <- its_boots %>% 
+  filter(date >= policy_date, vemquartile == 1) %>% 
+  group_by(county, date) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = ~mean(.x),
+              md = ~median(.x),
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            ))) %>% 
+  left_join(cnty_pop, by = "county") %>% 
+  mutate(across(cum_c_avd_mn:cum_d_avd_q975, 
+                .fns = ~.x/pop*1e5,
+                .names = "{.col}_p100k"))
+
+its_boots_cnty_vem <- its_boots %>% 
+  filter(date >= (its_end_date-8)) %>% 
+  group_by(county, vemquartile) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = ~mean(.x),
+              md = ~median(.x),
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            ))) %>% 
+  left_join(cnty_vem_pop, by = c("county", "vemquartile")) %>% 
+  mutate(across(cum_c_avd_mn:cum_d_avd_q975, 
+                .fns = ~.x/pop*1e5,
+                .names = "{.col}_p100k"))
+
+its_q12_cnties <- its_boots_cnty_vem %>% filter(vemquartile %in% c(1,2)) %>% group_by(county) %>% summarise(n = n()) %>% filter(n == 2) %>% pull(county)
+
+# Cumulative outcomes avoided in VEM Q1 zip codes over entire observation period by county
+its_boots_cnty <- its_boots %>% 
+  filter(date >= (its_end_date-8), vemquartile == 1) %>% 
+  group_by(county) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            ))) %>% 
+  left_join(cnty_pop, by = "county") %>% 
+  mutate(across(cum_c_avd_mn:cum_d_avd_q975, 
+                .fns = ~.x/pop*1e5,
+                .names = "{.col}_p100k"))
+
+its_boots_cnty$pop_group <- floor(log10(its_boots_cnty$pop))
+its_boots_cnty$pop_group[its_boots_cnty$pop_group == 7] <- 6
+its_boots_cnty$pop_group[its_boots_cnty$pop_group == 3] <- 4
+
+# Cumulative outcomes avoided in VEM Q1 zip codes among counties with pop >100k
+its_boots_cnty_lrg <- its_boots %>% 
+  filter(date >= (its_end_date-8), vemquartile == 1) %>% 
+  left_join(cnty_pop %>% mutate(pg100k = if_else(pop >= 1e5, 1, 0)), by = "county") %>% 
+  group_by(pg100k, iter) %>% 
+  summarise(across(cum_c_avd:cum_d_avd,
+                   sum),
+            pop = sum(pop)) %>%
+  ungroup() %>% 
+  mutate(across(cum_c_avd:cum_d_avd, 
+                .fns = ~.x/pop*1e5,
+                .names = "{.col}_p100k")) %>% 
+  group_by(pg100k) %>% 
+  summarise(across(cum_c_avd_p100k:cum_d_avd_p100k, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            ))) #%>% View 
+
+# Summary time series of cumulative outcomes avoided across the state
+its_boots_date_state <- its_boots %>% 
+  filter(date >= policy_date) %>% 
+  group_by(date, iter) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, sum)) %>% 
+  ungroup() %>% 
+  group_by(date) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+
+# Summary time series of cumulative outcomes avoided by VEM across the state
+its_boots_date_state_vem <- its_boots %>% 
+  group_by(vemquartile, date, iter) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, sum)) %>% 
+  ungroup() %>% 
+  group_by(vemquartile, date) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+
+
+# Cumulative outcomes avoided in VEM Q1 zip codes over entire observation statewide
+its_boots_state <- its_boots %>% 
+  filter(date >= (its_end_date-8), vemquartile == 1) %>% 
+  group_by(iter) %>% 
+  summarise(date = first(date),
+            across(cum_c_avd:cum_d_avd, sum)) %>% 
+  ungroup() %>% 
+  group_by(date) %>% 
+    summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+
+# Compare observed to predicted for model evaluation  
+its_boots_comps_vem <- its_boots %>% 
+  group_by(vemquartile, date, iter) %>% 
+  summarise(across(c_obs:d_avd, sum)) %>% 
+  ungroup() %>% 
+  group_by(vemquartile, date) %>% 
+  summarise(across(c_obs:d_avd, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+  
+
+rm(its_boots) ; gc()
+
+```
+
+```{r effect_est_boot_cum_state}
+cases_its_avd_md <- its_boots_state$cum_c_avd_md
+cases_its_avd_lo <- its_boots_state$cum_c_avd_q025
+cases_its_avd_hi <- its_boots_state$cum_c_avd_q975
+
+hosps_its_avd_md <- its_boots_state$cum_h_avd_md
+hosps_its_avd_lo <- its_boots_state$cum_h_avd_q025
+hosps_its_avd_hi <- its_boots_state$cum_h_avd_q975
+
+deaths_its_avd_md <- its_boots_state$cum_d_avd_md
+deaths_its_avd_lo <- its_boots_state$cum_d_avd_q025
+deaths_its_avd_hi <- its_boots_state$cum_d_avd_q975
+
+cases_its_avd_md_april <- its_boots_date_state$cum_c_avd_md[its_boots_date_state$date == ymd("20210426")]
+cases_its_avd_lo_april <- its_boots_date_state$cum_c_avd_q025[its_boots_date_state$date == ymd("20210426")]
+cases_its_avd_hi_april <- its_boots_date_state$cum_c_avd_q975[its_boots_date_state$date == ymd("20210426")]
+
+hosps_its_avd_md_april <- its_boots_date_state$cum_h_avd_md[its_boots_date_state$date == ymd("20210426")]
+hosps_its_avd_lo_april <- its_boots_date_state$cum_h_avd_q025[its_boots_date_state$date == ymd("20210426")]
+hosps_its_avd_hi_april <- its_boots_date_state$cum_h_avd_q975[its_boots_date_state$date == ymd("20210426")]
+
+deaths_its_avd_md_april <- its_boots_date_state$cum_d_avd_md[its_boots_date_state$date == ymd("20210426")]
+deaths_its_avd_lo_april <- its_boots_date_state$cum_d_avd_q025[its_boots_date_state$date == ymd("20210426")]
+deaths_its_avd_hi_april <- its_boots_date_state$cum_d_avd_q975[its_boots_date_state$date == ymd("20210426")]
+
+```
+
+```{r effect_est_boot_cum_cnty}
+cnty_lowest_cavd_md <- its_boots_cnty %>% filter(cum_c_avd_md_p100k == min(cum_c_avd_md_p100k)) %>% pull(cum_c_avd_md_p100k)
+cnty_lowest_cavd_q025 <- its_boots_cnty %>% filter(cum_c_avd_md_p100k == min(cum_c_avd_md_p100k)) %>% pull(cum_c_avd_q025_p100k)
+cnty_lowest_cavd_q975 <- its_boots_cnty %>% filter(cum_c_avd_md_p100k == min(cum_c_avd_md_p100k)) %>% pull(cum_c_avd_q975_p100k)
+worst_cnty_case_sum <- paste0(round(cnty_lowest_cavd_md,2), " (95%CI:", 
+                              round(cnty_lowest_cavd_q025,2)," - ",
+                              round(cnty_lowest_cavd_q975,2),")")
+
+cnty_lowest_havd_md <- its_boots_cnty %>% filter(cum_h_avd_md_p100k == min(cum_h_avd_md_p100k)) %>% pull(cum_h_avd_md_p100k)
+cnty_lowest_havd_q025 <- its_boots_cnty %>% filter(cum_h_avd_md_p100k == min(cum_h_avd_md_p100k)) %>% pull(cum_h_avd_q025_p100k)
+cnty_lowest_havd_q975 <- its_boots_cnty %>% filter(cum_h_avd_md_p100k == min(cum_h_avd_md_p100k)) %>% pull(cum_h_avd_q975_p100k)
+worst_cnty_hosp_sum <- paste0(round(cnty_lowest_havd_md,2)," (95%CI:",
+                              round(cnty_lowest_havd_q025,2)," - ",
+                              round(cnty_lowest_havd_q975,2),")")
+
+cnty_lowest_davd_md <- its_boots_cnty %>% filter(cum_d_avd_md_p100k == min(cum_d_avd_md_p100k)) %>% pull(cum_d_avd_md_p100k)
+cnty_lowest_davd_q025 <- its_boots_cnty %>% filter(cum_d_avd_md_p100k == min(cum_d_avd_md_p100k)) %>% pull(cum_d_avd_q025_p100k)
+cnty_lowest_davd_q975 <- its_boots_cnty %>% filter(cum_d_avd_md_p100k == min(cum_d_avd_md_p100k)) %>% pull(cum_d_avd_q975_p100k)
+worst_cnty_death_sum <- paste0(round(cnty_lowest_davd_md,2)," (95%CI:",
+                               round(cnty_lowest_davd_q025,2)," - ",
+                               round(cnty_lowest_davd_q975,2),")")
+
+cnty_highest_cavd_md <- its_boots_cnty %>% filter(cum_c_avd_md_p100k == max(cum_c_avd_md_p100k)) %>% pull(cum_c_avd_md_p100k)
+cnty_highest_cavd_q025 <- its_boots_cnty %>% filter(cum_c_avd_md_p100k == max(cum_c_avd_md_p100k)) %>% pull(cum_c_avd_q025_p100k)
+cnty_highest_cavd_q975 <- its_boots_cnty %>% filter(cum_c_avd_md_p100k == max(cum_c_avd_md_p100k)) %>% pull(cum_c_avd_q975_p100k)
+best_cnty_case_sum <- paste0(round(cnty_highest_cavd_md,2), " (95%CI:",
+                             round(cnty_highest_cavd_q025,2), " - ",
+                             round(cnty_highest_cavd_q975,2),")")
+
+cnty_highest_havd_md <- its_boots_cnty %>% filter(cum_h_avd_md_p100k == max(cum_h_avd_md_p100k)) %>% pull(cum_h_avd_md_p100k)
+cnty_highest_havd_q025 <- its_boots_cnty %>% filter(cum_h_avd_md_p100k == max(cum_h_avd_md_p100k)) %>% pull(cum_h_avd_q025_p100k)
+cnty_highest_havd_q975 <- its_boots_cnty %>% filter(cum_h_avd_md_p100k == max(cum_h_avd_md_p100k)) %>% pull(cum_h_avd_q975_p100k)
+best_cnty_hosp_sum <- paste0(round(cnty_highest_havd_md,2)," (95%CI:",
+                             round(cnty_highest_havd_q025,2)," - ",
+                             round(cnty_highest_havd_q975,2),")")
+
+cnty_highest_davd_md <- its_boots_cnty %>% filter(cum_d_avd_md_p100k == max(cum_d_avd_md_p100k)) %>% pull(cum_d_avd_md_p100k)
+cnty_highest_davd_q025 <- its_boots_cnty %>% filter(cum_d_avd_md_p100k == max(cum_d_avd_md_p100k)) %>% pull(cum_d_avd_q025_p100k)
+cnty_highest_davd_q975 <- its_boots_cnty %>% filter(cum_d_avd_md_p100k == max(cum_d_avd_md_p100k)) %>% pull(cum_d_avd_q975_p100k)
+best_cnty_death_sum <- paste0(round(cnty_highest_davd_md,2)," (95%CI:",
+                              round(cnty_highest_davd_q025,2)," - ",
+                              round(cnty_highest_davd_q975,2),")")
+```
+
+```{r obs_outcomes_summaries}
+vemq1_obs_cases <- sum(weekly_zip_sum %>% 
+                         filter(vemquartile == 1, date >= policy_date, date < its_end_date) %>% 
+                         pull(cases))
+
+vemq1_obs_hosps <- sum(weekly_zip_sum %>% 
+                         filter(vemquartile == 1, date >= policy_date, date < its_end_date) %>% 
+                         pull(hosps))
+
+vemq1_obs_deaths <- sum(weekly_zip_sum %>% 
+                          filter(vemquartile == 1, date >= policy_date, date < its_end_date) %>% 
+                          pull(deaths))
+```
+
+
+
+```{r ratios_setup}
+weekly_state_vem_sum <- weekly_zip_sum %>% 
+  filter(!is.na(hosps)) %>% 
+  filter(date >= its_start_date, date < its_end_date) %>% 
+  group_by(date, vemquartile) %>% 
+  summarise(across(cases:deaths, sum))
+
+weekly_state_vem_ratios <- bind_rows(
+  weekly_state_vem_sum %>% 
+    dplyr::select(date, vemquartile, cases) %>% 
+    pivot_wider(names_from = vemquartile, values_from = cases) %>% 
+    mutate(q4r = `1`/`4`,
+           q3r = `1`/`3`,
+           q2r = `1`/`2`,
+           q234r = `1`/(`2`+`3`+`4`),
+           q1pct = `1`/(`1`+`2`+`3`+`4`),
+           outcome = "cases"),
+  weekly_state_vem_sum %>% 
+    dplyr::select(date, vemquartile, hosps) %>% 
+    pivot_wider(names_from = vemquartile, values_from = hosps) %>% 
+    mutate(q4r = `1`/`4`,
+           q3r = `1`/`3`,
+           q2r = `1`/`2`,
+           q234r = `1`/(`2`+`3`+`4`),
+           q1pct = `1`/(`1`+`2`+`3`+`4`),
+           outcome = "hosps"),
+  weekly_state_vem_sum %>% 
+    dplyr::select(date, vemquartile, deaths) %>% 
+    pivot_wider(names_from = vemquartile, values_from = deaths) %>% 
+    mutate(q4r = `1`/`4`,
+           q3r = `1`/`3`,
+           q2r = `1`/`2`,
+           q234r = `1`/(`2`+`3`+`4`),
+           q1pct = `1`/(`1`+`2`+`3`+`4`),
+           outcome = "deaths")
+) %>% 
+  pivot_longer(q4r:q1pct, names_to = "VEMQ", values_to = "ratio")
+
+weekly_state_vemcf_ratios <- bind_rows(
+  weekly_state_vem_sum %>% 
+    left_join(weekly_state_avd_sum, by = c("date", "vemquartile")) %>% 
+    mutate(cases = if_else(vemquartile == 1, cases + c_avd_md , as.numeric(cases))) %>% 
+    pivot_wider(names_from = vemquartile, values_from = cases, id_cols = "date") %>% 
+    mutate(q4r = `1`/`4`,
+           q3r = `1`/`3`,
+           q2r = `1`/`2`,
+           q234r = `1`/(`2`+`3`+`4`),
+           q1pct = `1`/(`1`+`2`+`3`+`4`),
+           outcome = "cases") %>% 
+    dplyr::select(date, q4r:outcome),
+  weekly_state_vem_sum %>% 
+    left_join(weekly_state_avd_sum, by = c("date", "vemquartile")) %>% 
+    mutate(hosps = if_else(vemquartile == 1, hosps + h_avd_md, as.numeric(hosps))) %>% 
+    pivot_wider(names_from = vemquartile, values_from = hosps, id_cols = "date") %>% 
+    mutate(q4r = `1`/`4`,
+           q3r = `1`/`3`,
+           q2r = `1`/`2`,
+           q234r = `1`/(`2`+`3`+`4`),
+           q1pct = `1`/(`1`+`2`+`3`+`4`),
+           outcome = "hosps") %>% 
+    dplyr::select(date, q4r:outcome),
+  weekly_state_vem_sum %>% 
+    left_join(weekly_state_avd_sum, by = c("date", "vemquartile")) %>% 
+    mutate(deaths = if_else(vemquartile == 1, deaths + d_avd_md, as.numeric(deaths))) %>% 
+    pivot_wider(names_from = vemquartile, values_from = deaths, id_cols = "date") %>% 
+    mutate(q4r = `1`/`4`,
+           q3r = `1`/`3`,
+           q2r = `1`/`2`,
+           q234r = `1`/(`2`+`3`+`4`),
+           q1pct = `1`/(`1`+`2`+`3`+`4`),
+           outcome = "deaths") %>% 
+    dplyr::select(date, q4r:outcome)
+) %>% 
+  pivot_longer(q4r:q1pct, names_to = "VEMQ", values_to = "ratio")
+
+```
+
+
+## Results text  
+
+For all three outcomes considered, the candidate model with the best out of sample performance contained an intervention-county interaction term, cumulative case rate, cumulative vaccinated rate, and the percent of the population aged 50 and older (Supplementary Table X). The best model for deaths also included a term for the weekly testing rate, though this model performed only marginally better than one without testing (Supplementary Table X).
+
+From these models, it was estimated that in the eight months following the vaccine equity allocation, `r round(cases_its_avd_md)` (95%CI: `r round(cases_its_avd_lo)` - `r round(cases_its_avd_hi)`) cases, `r round(hosps_its_avd_md)` (95%CI: `r round(hosps_its_avd_lo)` - `r round(hosps_its_avd_hi)`) hospitalizations, and `r round(deaths_its_avd_md)` (95%CI: `r round(deaths_its_avd_lo)` - `r round(deaths_its_avd_hi)`) deaths were averted in VEM Q1 zip codes. This represents `r round(cases_its_avd_md/(vemq1_obs_cases+cases_its_avd_md)*100, 1)`% of all cases, `r round(hosps_its_avd_md/(vemq1_obs_hosps+hosps_its_avd_md)*100, 1)`% of all hospitalizations, and `r round(deaths_its_avd_md/(vemq1_obs_deaths+deaths_its_avd_md)*100, 1)`% of all deaths that would have occurred in VEM Q1 after the policy. Most of the outcomes averted came after July 1, 2021 during California's Delta variant wave (Fig 1). However, `r round(cases_its_avd_md_april)` (95%CI: `r round(cases_its_avd_lo_april)` - `r round(cases_its_avd_hi_april)`) cases, `r round(hosps_its_avd_md_april)` (95%CI: `r round(hosps_its_avd_lo_april)` - `r round(hosps_its_avd_hi_april)`) hospitalizations, and `r round(deaths_its_avd_md_april)` (95%CI: `r round(deaths_its_avd_lo_april)` - `r round(deaths_its_avd_hi_april)`) deaths were averted even in the first two months following the equity allocation.  
+
+While `r round(vem_pop$pop[vem_pop$vemquartile == 1]/sum(vem_pop$pop)*100)`% of California's population resides in VEM Q1 areas, residents in VEM Q1 accounted for `r round(weekly_state_vem_ratios %>% filter(VEMQ == "q1pct", date < policy_date, outcome == "cases") %>% pull(ratio) %>% mean(), 2)*100`% of cases, `r round(weekly_state_vem_ratios %>% filter(VEMQ == "q1pct", date < policy_date, outcome == "hosps") %>% pull(ratio) %>% mean(), 2)*100`% of hospitalizations, and `r round(weekly_state_vem_ratios %>% filter(VEMQ == "q1pct", date < policy_date, outcome == "deaths") %>% pull(ratio) %>% mean(), 2)*100`% of mortalities in the two months before the policy (Fig 2). From the counterfactual analysis in the absence of the policy, this discrepancy is estimated to persist or increase (Fig 2, dashed lines). However, because of the outcomes averted due to the policy, excess COVID-19 cases and--to a lesser extent--hospitalizations in VEM Q1 were reduced (Fig 2, solid lines). Briefly in April and again in July, the number of cases in VEM Q1 reached levels proportionate to the VEM Q1 population ratio, suggesting a lack of excess risk in VEM Q1 (Fig 2). In the absence of the policy, counterfactual estimates suggest that this level would not have been reached.   
+
+There was variability in estimated outcomes avoided at the county level. Normalizing by population size, the best performing counties averted `r best_cnty_case_sum` cases/100,000, `r best_cnty_hosp_sum` hospitalizations/100,000, and `r best_cnty_death_sum` deaths/100,000, while the worst performing counties averted `r worst_cnty_case_sum` cases/100,000, `r worst_cnty_hosp_sum` hospitalizations/100,000, and `r worst_cnty_death_sum` deaths/100,000. Negative outcomes averted result from more outcomes estimated in the counterfactual scenarios than were observed, implying the policy had a negative impact in these counties. However, this occurred most commonly in counties with smaller populations. Among counties with a population larger than 100,000 (representing 97.6% of the State's population), the net rates were `r round(its_boots_cnty_lrg$cum_c_avd_p100k_md[its_boots_cnty_lrg$pg100k == 1],2)` (95%CI: `r round(its_boots_cnty_lrg$cum_c_avd_p100k_q025[its_boots_cnty_lrg$pg100k == 1],2)` -  `r round(its_boots_cnty_lrg$cum_c_avd_p100k_q975[its_boots_cnty_lrg$pg100k == 1],2)`) cases/100,000 averted,  `r round(its_boots_cnty_lrg$cum_h_avd_p100k_md[its_boots_cnty_lrg$pg100k == 1],2)` (95%CI: `r round(its_boots_cnty_lrg$cum_h_avd_p100k_q025[its_boots_cnty_lrg$pg100k == 1],2)` -  `r round(its_boots_cnty_lrg$cum_h_avd_p100k_q975[its_boots_cnty_lrg$pg100k == 1],2)`) hospitalizations/100,000 averted, and  `r round(its_boots_cnty_lrg$cum_d_avd_p100k_md[its_boots_cnty_lrg$pg100k == 1],2)` (95%CI: `r round(its_boots_cnty_lrg$cum_d_avd_p100k_q025[its_boots_cnty_lrg$pg100k == 1],2)` -  `r round(its_boots_cnty_lrg$cum_d_avd_p100k_q975[its_boots_cnty_lrg$pg100k == 1],2)`) deaths/100,000 averted.  
+
+## Figures  
+
+### Model predicted vs observed outcomes  
+#### Cases  
+```{r mod_v_obs_cases}
+its_boots_comps_vem %>% 
+  mutate(vemquartile = paste0("VEM Quartile ", as.character(vemquartile))) %>% 
+  ggplot(aes(x = date)) +
+    geom_ribbon(aes(ymin = c_mod_q025/1000, ymax =c_mod_q975/1000), 
+                col = "grey50", alpha = 0.5) +
+    geom_vline(xintercept = policy_date, col = "grey50", lty = 3) +
+    geom_line(aes(y = c_obs_md/1000), col = "blue", size = 1.2) +
+    geom_line(aes(y = (c_obs_md + c_avd_md)/1000), col = "red") + 
+    geom_line(aes(y = c_mod_md/1000), col = "black") +
+    facet_wrap(.~vemquartile, scales = "free_y") +
+    scale_x_date(date_breaks = "2 months",
+                 date_labels = "%b '%y") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = "",
+         y = "Cases (1000s)")
+    
+ggsave(here::here("plots/cases_mod_obs_cf_comp.jpg"),
+       units = "in", height = 5, width = 5, dpi = 300)
+```
+
+#### Hospitalizations  
+```{r mod_v_obs_hosps}
+its_boots_comps_vem %>% 
+  mutate(vemquartile = paste0("VEM Quartile ", as.character(vemquartile))) %>% 
+  ggplot(aes(x = date)) +
+    geom_ribbon(aes(ymin = h_mod_q025/1000, ymax =h_mod_q975/1000), 
+                col = "grey50", alpha = 0.5) +
+    geom_vline(xintercept = policy_date, col = "grey50", lty = 3) +
+    geom_line(aes(y = h_obs_md/1000), col = "blue", size = 1.2) +
+    geom_line(aes(y = (h_obs_md + h_avd_md)/1000), col = "red") + 
+    geom_line(aes(y = h_mod_md/1000), col = "black") +
+    facet_wrap(.~vemquartile, scales = "free_y") +
+    scale_x_date(date_breaks = "2 months",
+                 date_labels = "%b '%y") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = "",
+         y = "Hospitalizations (1000s)")
+    
+ggsave(here::here("plots/hosps_mod_obs_cf_comp.jpg"),
+       units = "in", height = 5, width = 5, dpi = 300)
+
+```
+
+#### Deaths  
+```{r mod_v_obs_deaths}
+its_boots_comps_vem %>% 
+  mutate(vemquartile = paste0("VEM Quartile ", as.character(vemquartile))) %>% 
+  ggplot(aes(x = date)) +
+    geom_ribbon(aes(ymin = d_mod_q025, ymax =d_mod_q975), 
+                col = "grey50", alpha = 0.5) +
+    geom_vline(xintercept = policy_date, col = "grey50", lty = 3) +
+    geom_line(aes(y = d_obs_md), col = "blue", size = 1.2) +
+    geom_line(aes(y = (d_obs_md + d_avd_md)), col = "red") + 
+    geom_line(aes(y = d_mod_md), col = "black") +
+    facet_wrap(.~vemquartile, scales = "free_y") +
+    scale_x_date(date_breaks = "2 months",
+                 date_labels = "%b '%y") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = "",
+         y = "Deaths")
+    
+ggsave(here::here("plots/deaths_mod_obs_cf_comp.jpg"),
+       units = "in", height = 5, width = 5, dpi = 300)
+
+```
+
+### Cumulative avoided and county results  
+
+```{r cases_avd_ts}
+cases_avd_ts_fig <- its_boots_date_state %>% 
+  ggplot() +
+  geom_ribbon(aes(x = date, ymin = cum_c_avd_q025, ymax = cum_c_avd_q975), col = "grey50", alpha = 0.5) +
+  geom_line(aes(x = date, y = cum_c_avd_md)) +
+  theme_classic() +
+  #theme_here() +
+  theme(axis.text.x = element_blank()) +
+  #scale_x_date(date_breaks = "1 month", date_labels = "%b '%y") +
+  labs(x = "",
+       tag = "A",
+       y = "Cases averted")
+
+```
+
+```{r hosps_avd_ts}
+hosps_avd_ts_fig <- its_boots_date_state %>% 
+  ggplot() +
+  geom_ribbon(aes(x = date, ymin = cum_h_avd_q025, ymax = cum_h_avd_q975), col = "grey50", alpha = 0.5) +
+  geom_line(aes(x = date, y = cum_h_avd_md)) +
+  theme_classic() +
+  #theme_here() +
+  theme(axis.text.x = element_blank()) +
+  #scale_x_date(date_breaks = "1 month", date_labels = "%b '%y") +
+  labs(x = "",
+       tag = "C",
+       y = "Hospitalizations averted")
+
+```
+
+```{r deaths_avd_ts}
+deaths_avd_ts_fig <- its_boots_date_state %>% 
+  ggplot() +
+  geom_ribbon(aes(x = date, ymin = cum_d_avd_q025, ymax = cum_d_avd_q975), col = "grey50", alpha = 0.5) +
+  geom_line(aes(x = date, y = cum_d_avd_md)) +
+  theme_classic() +
+  #theme_here() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b '%y") +
+  labs(x = "",
+       tag = "E",
+       y = "Deaths averted")
+
+```
+
+```{r chd_avd_fig}
+outcomes_avd_ts_fig <- its_boots_date_state %>% 
+  mutate(cum_c_avd_md10k = cum_c_avd_md/10000,
+         cum_h_avd_md1k = cum_h_avd_md/1000,
+         cum_d_avd_md100 = cum_d_avd_md/100) %>% 
+  pivot_longer(cols = c("cum_c_avd_md10k", "cum_h_avd_md1k", "cum_d_avd_md100")) %>% 
+  ggplot() +
+    geom_ribbon(data = its_boots_date_state,
+                aes(x = date, ymin = cum_c_avd_q025/10000, ymax = cum_c_avd_q975/10000), fill = "goldenrod2", alpha = 0.25) +
+    geom_ribbon(data = its_boots_date_state,
+                aes(x = date, ymin = cum_h_avd_q025/1000, ymax = cum_h_avd_q975/1000), fill = "darkorange3", alpha = 0.25) +
+    geom_ribbon(data = its_boots_date_state,
+                aes(x = date, ymin = cum_d_avd_q025/100, ymax = cum_d_avd_q975/100), fill = "firebrick3", alpha = 0.25) +
+    geom_line(aes(x = date, y = value, col = name), size = 1.2) +
+    scale_color_manual(breaks = c("cum_c_avd_md10k", "cum_h_avd_md1k", "cum_d_avd_md100"),
+                       labels = c("Cases (10,000s)", "Hospitalizations (1000s)", "Deaths (100s)"),
+                       values = c("goldenrod2", "darkorange3", "firebrick3")) +
+    theme_classic() +
+    theme_here() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          legend.position = "top") +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b '%y") +
+    scale_y_continuous(limits = c(0,14), breaks = seq(0,12, by = 2)) +
+    labs(x = "",
+         y = "Outcomes Avoided",
+         #tag = "A",
+         col = "")
+
+#outcomes_avd_ts_fig
+
+#ggsave(here::here("plots/outcomes_avoided_ts.png"), 
+#       units = "in", height = 4, width = 6, dpi = 300)
+```
+
+```{r cases_avd_cnty}
+
+case_avd_cnty_dat <- its_boots_cnty %>% 
+  mutate(county = factor(county, levels = its_boots_cnty %>% arrange(desc(cum_c_avd_md_p100k)) %>% pull(county))) 
+case_avd_cnty_fig <- case_avd_cnty_dat %>% 
+  filter(cum_c_avd_md_p100k > -5000) %>% 
+  ggplot(aes(x = county, y = cum_c_avd_md_p100k)) +
+    geom_hline(yintercept = 0, col = "grey50") +
+    geom_point(aes(shape = as.factor(pop_group)), size = 2) +
+    geom_errorbar(aes(ymin = cum_c_avd_q025_p100k, ymax = cum_c_avd_q975_p100k)) +
+    scale_shape_manual(breaks = c("4", "5", "6"),
+                       values = c(16, 17, 15),
+                       labels = c("<100", "100 - 1,000", ">1,000")) +
+    #scale_y_continuous(limits = c(2000,-2000)) +
+    theme_classic() +
+    #theme_here() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = c(0.2,0.25),
+          legend.background = element_blank(),
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 9)) +
+    labs(shape = "County Population (1000s)",
+         tag = "B",
+         y = "Cases averted\nper 100k",
+         x = "")
+
+# Viz normalizing by rate per 100k VEM Q1 residents rather than total population
+
+# case_avd_cnty_fig <- its_boots_cnty_vem %>% 
+#   filter(vemquartile == 1) %>% 
+#   left_join(its_boots_cnty %>% dplyr::select(county, pop_group), by = "county") %>%  #get pop_group for symbology
+#   mutate(county = factor(county, levels = its_boots_cnty_vem %>% filter(vemquartile == 1) %>% arrange(desc(cum_c_avd_md_p100k)) %>% pull(county))) %>% 
+#   #filter(cum_c_avd_md_p100k > -5000) %>% 
+#   ggplot(aes(x = county, y = cum_c_avd_md_p100k)) +
+#     geom_hline(yintercept = 0, col = "grey50") +
+#     geom_point(aes(shape = as.factor(pop_group)), size = 2) +
+#     geom_errorbar(aes(ymin = cum_c_avd_q025_p100k, ymax = cum_c_avd_q975_p100k)) +
+#     scale_shape_manual(breaks = c("4", "5", "6"),
+#                        values = c(16, 17, 15),
+#                        labels = c("<100,000", "100,000 - 1,000,000", "1,000,000")) +
+#     #scale_y_continuous(limits = c(2000,-2000)) +
+#     theme_classic() +
+#     theme(axis.text.x = element_blank(),
+#           legend.position = c(0.1,0.2)) +
+#     labs(shape = "County\nPopulation",
+#          tag = "B",
+#          y = "Cases averted per 100k VEM Q1 residents",
+#          x = "")
+
+#case_avd_cnty_fig
+```
+
+```{r hosps_avd_cnty}
+hosp_avd_cnty_dat <- its_boots_cnty %>% 
+  mutate(county = factor(county, levels = its_boots_cnty %>% arrange(desc(cum_h_avd_md_p100k)) %>% pull(county)),
+         cum_h_avd_q025_p100k = if_else(cum_h_avd_q025_p100k < -200, -Inf, cum_h_avd_q025_p100k))
+
+hosp_avd_cnty_fig <- hosp_avd_cnty_dat %>% 
+  #filter(cum_c_avd_md_p100k > -5000) %>% 
+  ggplot(aes(x = county, y = cum_h_avd_md_p100k)) +
+    geom_hline(yintercept = 0, col = "grey50") +
+    geom_point(aes(shape = as.factor(pop_group)), size = 2) +
+    geom_errorbar(aes(ymin = cum_h_avd_q025_p100k, ymax = cum_h_avd_q975_p100k)) +
+    scale_shape_manual(breaks = c("4", "5", "6"),
+                       values = c(16, 17, 15),
+                       labels = c("<100,000", "100,000 - 1,000,000", ">1,000,000")) +
+    #scale_y_continuous(limits = c(2000,-2000)) +
+    theme_classic() +
+    #theme_here() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = "none") +
+    labs(tag = "D",
+         y = "Hospitalizations averted\nper 100k",
+         x = "")
+
+#hosp_avd_cnty_fig
+```
+
+```{r deaths_avd_cnty}
+death_avd_cnty_dat <- its_boots_cnty %>% 
+  mutate(county = factor(county, levels = its_boots_cnty %>% arrange(desc(cum_d_avd_md_p100k)) %>% pull(county)),
+         cum_d_avd_q025_p100k = if_else(cum_d_avd_q025_p100k < -100, -Inf, cum_d_avd_q025_p100k))
+
+death_avd_cnty_fig <- death_avd_cnty_dat %>% 
+  #filter(cum_d_avd_md_p100k > -20) %>% 
+  ggplot(aes(x = county, y = cum_d_avd_md_p100k)) +
+    geom_hline(yintercept = 0, col = "grey50") +
+    geom_point(aes(shape = as.factor(pop_group)), size = 2) +
+    geom_errorbar(aes(ymin = cum_d_avd_q025_p100k, ymax = cum_d_avd_q975_p100k)) +
+    scale_shape_manual(breaks = c("4", "5", "6"),
+                       values = c(16, 17, 15),
+                       labels = c("<100,000", "100,000 - 1,000,000", ">1,000,000")) +
+    #scale_y_continuous(limits = c(2000,-2000)) +
+    theme_classic() +
+    #theme_here() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = "none") +
+    labs(tag = "F",
+         y = "Mortalities averted\nper 100k",
+         x = "")
+
+#death_avd_cnty_fig
+```
+
+
+
+
+```{r ggplot_avd_fig, eval = FALSE}
+bind_rows(
+  weekly_state_vem_sum %>% filter(date >= policy_date) %>% mutate(vemquartile = as.character(vemquartile)) %>% dplyr::select(date, vemquartile, cases),
+  weekly_state_avd_sum %>% filter(vemquartile == 1) %>% mutate(vemquartile = "1a") %>% dplyr::select(date, vemquartile, "cases" = c_avd_md)
+)  %>% 
+  mutate(vemquartile = factor(vemquartile, levels = c("1a", "1", "2", "3", "4"))) %>% 
+  ggplot(aes(x = date, y = cases, fill = vemquartile)) +
+    geom_col() +
+    scale_fill_manual(values = c("royalblue", "lightblue","lightgreen","darkgreen", "grey50"),
+                      breaks = c("1", "2", "3", "4", "1a")) +
+    theme_classic()
+```
+
+```{r}
+bind_rows(
+  case_avd_cnty_dat %>% 
+    dplyr::select(county, 
+                  "md" = cum_c_avd_md_p100k, 
+                  "q025" = cum_c_avd_q025_p100k, 
+                  "q975" = cum_c_avd_q975_p100k,
+                  "Population" = pop_group) %>% 
+    mutate(outcome = "Cases"),
+  hosp_avd_cnty_dat %>% 
+    dplyr::select(county, 
+                  "md" = cum_h_avd_md_p100k, 
+                  "q025" = cum_h_avd_q025_p100k, 
+                  "q975" = cum_h_avd_q975_p100k,
+                  "Population" = pop_group) %>% 
+    mutate(outcome = "Hospitalizations"),
+  death_avd_cnty_dat %>% 
+    dplyr::select(county, 
+                  "md" = cum_d_avd_md_p100k, 
+                  "q025" = cum_d_avd_q025_p100k, 
+                  "q975" = cum_d_avd_q975_p100k,
+                  "Population" = pop_group) %>% 
+    mutate(outcome = "Mortalities")
+) %>% 
+  mutate(q025 = if_else(q025 < -10000, -Inf, q025),
+         Population = factor(Population, 
+                             levels = c("4", "5", "6"), 
+                             labels = c("<100,000", "100,000 - 1,000,000", ">1,000,000"))) %>% 
+  ggplot(aes(x = county, y = md)) +
+    geom_hline(yintercept = 0, col = "grey50") +
+    geom_point(aes(shape = as.factor(Population)), size = 2.2) +
+    geom_errorbar(aes(ymin = q025, ymax = q975)) +
+    facet_grid(outcome ~ Population, scales = "free_y", switch = "y") +
+    scale_shape_manual(breaks = c("<100,000", "100,000 - 1,000,000", ">1,000,000"),
+                       values = c(16, 17, 15)) +
+    scale_x_discrete(expand = c(0.05,0.05)) +
+    #scale_y_continuous(limits = c(2000,-2000)) +
+    theme_classic() +
+    #theme_here() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          panel.border = element_rect(color = "grey10", fill = NA, size = 1), 
+          strip.background = element_blank(),
+          legend.position = "none") +
+    #coord_cartesian(xlim = c(50, 350), ylim = c(10, 35), clip = "off") +
+    theme(plot.tag.position = "top") +
+    labs(tag = "County Population",
+         y = "Averted per 100k",
+         x = "")
+
+ggsave(here::here("plots/county_results_p100k.png"),
+       height = 4, width = 6.5, dpi = 300, units = "in")
+
+```
+
+### VEM Quartile Outcomes Averted  
+```{r outcomes_averted_all_qs, include = FALSE}
+its_boots_date_state_vem %>% 
+  ggplot(aes(x = date, 
+             y = cum_c_avd_mn, ymin = cum_c_avd_q025, ymax = cum_c_avd_q975,
+             col = as.factor(vemquartile),
+             fill = as.factor(vemquartile))) + 
+    geom_line() +
+    geom_ribbon(alpha = 0.5) +
+    scale_color_manual(values = c("royalblue", "lightblue", "lightgreen","darkgreen")) +
+    scale_fill_manual(values = c("royalblue", "lightblue", "lightgreen","darkgreen")) +
+    theme_classic()
+```
+
+
+### VEM Quartile ratio figures  
+
+```{r vemq_ggplot, include = FALSE}
+weekly_state_vem_ratios %>% 
+  ggplot(aes(x = date, y = ratio, col = VEMQ)) +
+    geom_hline(yintercept = 1, lty = 3, col = "grey50") +
+    geom_line() +
+    geom_line(data = weekly_state_vemcf_ratios,
+              aes(x = date, y = ratio, col = VEMQ),
+              lty = 2) +
+    facet_grid(VEMQ~outcome, scales = "free_y") +
+    theme_classic()
+```
+
+```{r vemq_ggplot2, include = FALSE}
+weekly_state_vem_ratios %>% 
+  filter(VEMQ == "q2r") %>% 
+  ggplot(aes(x = date, y = ratio)) +
+    geom_hline(yintercept = 1, lty = 3, col = "grey50") +
+    geom_line() +
+    geom_line(data = weekly_state_vemcf_ratios %>% filter(VEMQ == "q2r"),
+              aes(x = date, y = ratio),
+              lty = 2) +
+    facet_wrap(.~outcome) +
+    theme_classic()
+
+```
+
+
+```{r outcome_ratios_ggplot}
+outcome_ratios <- bind_rows(
+  weekly_state_vem_ratios %>% 
+    dplyr::select(date, outcome, VEMQ, ratio) %>% 
+    mutate(type = "observed"),
+  weekly_state_vemcf_ratios %>% mutate(type = "counterfactual")
+) %>% 
+  filter(VEMQ == "q1pct") %>%   
+  mutate(outcome = factor(outcome, 
+                          levels = c("cases", "hosps", "deaths"), 
+                          labels = c("Cases", "Hospitalizations", "Deaths")),
+         type = factor(type, levels = c("observed", "counterfactual")))
+
+outcome_ratios %>% 
+  ggplot(aes(x = date, y = ratio*100, col = outcome, lty = type)) +
+    geom_hline(yintercept = vem_pop$pop[vem_pop$vemquartile == 1]/sum(vem_pop$pop)*100, lty = 2, col = "grey50") +
+    geom_vline(xintercept = policy_date, lty = 2, col = "grey50") +
+    geom_line() +
+    facet_wrap(.~outcome, nrow = 3) +
+    scale_x_date(date_breaks = "1 month",
+                 date_labels = "%b %d",
+                 limits = c(its_start_date, its_end_date)) +
+    scale_y_continuous(limits = c(20, 60),
+                       breaks = c(20, 40, 60)) +
+    scale_color_manual(values = c("#00acc5","#ff9347", "#ce0060")) +
+    theme_classic() +
+    theme(strip.background = element_blank(),
+          axis.text.x = element_text(size = 6, angle = 45, hjust = 1),
+          axis.text.y = element_text(size = 6),
+          #legend.position = "bottom",
+          legend.text = element_text(size = 8)) +
+    guides(col = F) +
+    labs(y = "Percent of COVID-19 outcomes\noccurring in VEM Q1",
+         x = "",
+         col = "",
+         lty = "")
+
+ggsave(here::here("plots/outcomes_ratios.png"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+ggsave(here::here("plots/outcomes_ratios.pdf"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+```
+
+```{r cases_ratios_ggplot}
+outcome_ratios %>% 
+  filter(outcome == "Cases") %>% 
+  ggplot(aes(x = date, y = ratio*100, col = type)) +
+    geom_hline(yintercept = vem_pop$pop[vem_pop$vemquartile == 1]/sum(vem_pop$pop)*100, lty = 2, col = "grey50") +
+    geom_vline(xintercept = policy_date, lty = 2, col = "grey50") +
+    geom_line(size = 1.2) +
+    scale_x_date(date_breaks = "1 month",
+                 date_labels = "%b",
+                 limits = c(its_start_date, its_end_date)) +
+    scale_y_continuous(limits = c(20, 60),
+                       breaks = c(20, 40, 60)) +
+    scale_color_manual(values = c("#00acc5","#ff9347")) +
+    theme_classic() +
+    theme(strip.background = element_blank(),
+          axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10),
+          #legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.position = c(0.8,0.8)) +
+    #guides(col = F) +
+    labs(y = "Percent of COVID-19 cases\noccurring in VEM Q1",
+         x = "",
+         col = "",
+         lty = "")
+
+ggsave(here::here("plots/cases_ratios.png"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+ggsave(here::here("plots/cases_ratios.pdf"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+write_csv(outcome_ratios,
+          here::here("data/ExhibitData/exhibit3_data.csv"))
+```
+
+```{r hospitalizations_ratios_ggplot}
+outcome_ratios %>% 
+  filter(outcome == "Hospitalizations") %>% 
+  ggplot(aes(x = date, y = ratio*100, col = type)) +
+    geom_hline(yintercept = vem_pop$pop[vem_pop$vemquartile == 1]/sum(vem_pop$pop)*100, lty = 2, col = "grey50") +
+    geom_vline(xintercept = policy_date, lty = 2, col = "grey50") +
+    geom_line(size = 1.2) +
+    scale_x_date(date_breaks = "1 month",
+                 date_labels = "%b",
+                 limits = c(its_start_date, its_end_date)) +
+    scale_y_continuous(limits = c(20, 60),
+                       breaks = c(20, 40, 60)) +
+    scale_color_manual(values = c("#00acc5","#ff9347")) +
+    theme_classic() +
+    theme(strip.background = element_blank(),
+          axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10),
+          #legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.position = c(0.8,0.8)) +
+    #guides(col = F) +
+    labs(y = "Percent of COVID-19 hospitalizations\noccurring in VEM Q1",
+         x = "",
+         col = "",
+         lty = "")
+
+ggsave(here::here("plots/hospitalizations_ratios.png"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+ggsave(here::here("plots/hospitalizations_ratios.pdf"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+```
+
+```{r hospitalizations_ratios_ggplot}
+outcome_ratios %>% 
+  filter(outcome == "Deaths") %>% 
+  ggplot(aes(x = date, y = ratio*100, col = type)) +
+    geom_hline(yintercept = vem_pop$pop[vem_pop$vemquartile == 1]/sum(vem_pop$pop)*100, lty = 2, col = "grey50") +
+    geom_vline(xintercept = policy_date, lty = 2, col = "grey50") +
+    geom_line(size = 1.2) +
+    scale_x_date(date_breaks = "1 month",
+                 date_labels = "%b",
+                 limits = c(its_start_date, its_end_date)) +
+    scale_y_continuous(limits = c(20, 60),
+                       breaks = c(20, 40, 60)) +
+    scale_color_manual(values = c("#00acc5","#ff9347")) +
+    theme_classic() +
+    theme(strip.background = element_blank(),
+          axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10),
+          #legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.position = c(0.8,0.8)) +
+    #guides(col = F) +
+    labs(y = "Percent of COVID-19 deaths\noccurring in VEM Q1",
+         x = "",
+         col = "",
+         lty = "")
+
+ggsave(here::here("plots/deaths_ratios.png"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+ggsave(here::here("plots/deaths_ratios.pdf"),
+       height = 3.5, width = 5, dpi = 300, units = "in")
+
+```
+
+```{r bp_propq1, eval = FALSE}
+# Not developed, ggplot fig does the trick
+png(here::here("plots/baseplot_outcomes_ratios.png"),
+               width = 6, height = 7, units = "in", res = 300)
+
+par(mfrow = c(3,2),
+    mgp = c(1.6,0.5,0),
+    las = 1,
+    tcl = -0.2,
+    xaxs = "r", yaxs = "i")
+
+dev.off()
+```
+
+
+### Counterfactual time series and cumulative avoided base plot   
+
+
+```{r bp1_save, message=F, include=F, warning=F}
+weekly_state_vem_sum <- weekly_state_vem_sum %>% filter(date >= policy_date)
+end_wk_ind <- max(weekly_zip_sum %>% filter(date < its_end_date) %>% pull(t_wk))+1
+
+# png(here::here("plots/baseplot_outcomes_averted.png"),
+#                width = 7, height = 8, units = "in", res = 300)
+pdf(here::here("plots/baseplot_outcomes_averted.pdf"),
+                width = 7, height = 8)
+par(mfrow = c(3,2),
+    mgp = c(1.6,0.5,0),
+    las = 1,
+    tcl = -0.2,
+    xaxs = "r", yaxs = "i")
+
+# A1 - Cases averted figure -----------------------------
+par(mar = c(2,4,1,1.2))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,140000),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  mtext("A", adj = -0.1, line = -1, cex = 1.5)
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10,12)*10000,
+       labels = c("0", paste0(c(20, 40, 60, 80,100,120), "k")))
+  mtext("Weekly Cases", side = 2, line = 2.2, las = 0)
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = rep("", 8))
+  legend("topleft",
+         pch = 15,
+         col = c("royalblue", "lightblue","lightgreen","darkgreen"),
+         legend = c("Q1", "Q2", "Q3", "Q4"),
+         title = "VEM Quartile",
+         bty = "n")
+  legend("top",
+         fill = "royalblue",
+         border = "royalblue",
+         legend = "Q1-Averted",
+         density = c(30,30),
+         angle = c(45, 360-45),
+         bty = "n")
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$c_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$c_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+# A2 - Cumulative cases averted ----------------
+par(mar = c(2,4.2,1,1))
+plot(x = its_boots_date_state$date,
+     y = its_boots_date_state$cum_c_avd_md,
+     ylim = c(0, 240000),
+     type = "n",
+     col = "royalblue",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "n")
+  mtext("D", adj = -0.1, line = -1, cex = 1.5)
+  axis(2,
+       at = c(0, 40, 80, 120, 160,200,241)*1000,
+       labels = c("0", paste0(c(40, 80, 120, 160,200), "k"), ""))
+  mtext("Cumulative Cases\nAverted in VEM Q1", side = 2, line = 2.5, las = 0)
+  axis(1,
+       at = seq.Date(policy_date, its_end_date, by = "1 month"),
+       labels = rep("", 9))
+  axis(1,
+       at = seq.Date(policy_date-30, its_end_date-7, by = "1 month"),
+       labels = F, tick = F)
+  # mtext("Cumulative cases averted (10,000s)",
+  #       side = 4, line = 1.6, las = 0)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date),
+                min(its_boots_date_state$date)), 
+          y = c(its_boots_date_state$cum_c_avd_q975[1],
+                its_boots_date_state$cum_c_avd_q975,
+                its_boots_date_state$cum_c_avd_q025[length(its_boots_date_state$cum_c_avd_q975)], 
+                rev(its_boots_date_state$cum_c_avd_q025),
+                its_boots_date_state$cum_c_avd_q025[1]),
+          col = adjustcolor("royalblue", alpha.f = 0.4),
+          #fillOddEven = T,
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = its_boots_date_state$cum_c_avd_md,
+        col = "royalblue")
+  
+# B1 - Hospitalizations averted figure ---------------------
+par(mar = c(2,4,1,1.2))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,max(its_boots_state$cum_h_avd_mn)+400),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  mtext("B", adj = -0.1, line = -0.3, cex = 1.5)
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10,12)*1000,
+       labels = c("0", paste0(c(2, 4, 6, 8,10,12), "k")))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = rep("", 8))
+  mtext("Weekly Hospitalizations", side = 2, line = 2.2, las = 0)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+
+# B2 - Cumulative hospitalizations averted ----------------
+par(mar = c(2,4.2,1,1))
+plot(x = its_boots_date_state$date,
+     y = its_boots_date_state$cum_h_avd_md,
+     ylim = c(0, 18000),
+     type = "n",
+     col = "royalblue",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "n")
+  mtext("E", adj = -0.1, line = -0.3, cex = 1.5)
+  axis(2,
+       at = c(0, 4, 8, 12, 16, 20)*1000,
+       labels = c("0", paste0(c(4, 8, 12, 16), "k"), ""))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date, by = "1 month"),
+       labels = rep("", 9))
+  axis(1,
+       at = seq.Date(policy_date-30, its_end_date-7, by = "1 month"),
+       labels = F, tick = F)
+  mtext("Cumulative Hospitalizations\nAverted in VEM Q1", side = 2, line = 2.5, las = 0)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date),
+                min(its_boots_date_state$date)), 
+          y = c(its_boots_date_state$cum_h_avd_q975[1],
+                its_boots_date_state$cum_h_avd_q975,
+                its_boots_date_state$cum_h_avd_q025[length(its_boots_date_state$cum_h_avd_q975)], 
+                rev(its_boots_date_state$cum_h_avd_q025),
+                its_boots_date_state$cum_h_avd_q025[1]),
+          col = adjustcolor("royalblue", alpha.f = 0.4),
+          #fillOddEven = T,
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = its_boots_date_state$cum_h_avd_md,
+        col = "royalblue")
+  
+# C1 - Deaths averted figure ---------------------
+par(mar = c(2,4,1,1.2))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,1300),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  mtext("C", adj = -0.1, line = -0.3, cex = 1.5)
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10,12)*100,
+       labels = c("0", "200", "400", "600", "800", "1000", "1200"))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = c("Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct"))
+  mtext("Weekly Deaths", side = 2, line = 2.2, las = 0)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+  
+  
+# C2 - Cumulative hospitalizations averted ----------------
+par(mar = c(2,4.2,1,1))
+plot(x = its_boots_date_state$date,
+     y = its_boots_date_state$cum_d_avd_md,
+     ylim = c(0, 1800),
+     type = "n",
+     col = "royalblue",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "n")
+  mtext("F", adj = -0.1, line = -0.3, cex = 1.5)
+  axis(2,
+       at = c(0, 4, 8, 12, 16,20)*100,
+       labels = c("0", "400", "800","1200", "1600", ""))
+  mtext("Cumulative Deaths\nAverted in VEM Q1", side = 2, line = 2.5, las = 0)
+  axis(1,
+       at = seq.Date(policy_date, its_end_date, by = "1 month"),
+       labels = c("Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", " "))
+  axis(1,
+       at = seq.Date(policy_date-30, its_end_date-7, by = "1 month"),
+       labels = F, tick = F)
+  # mtext("Cumulative mortalities averted (100s)",
+  #       side = 4, line = 1.6, las = 0)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date),
+                min(its_boots_date_state$date)), 
+          y = c(its_boots_date_state$cum_d_avd_q975[1],
+                its_boots_date_state$cum_d_avd_q975,
+                its_boots_date_state$cum_d_avd_q025[length(its_boots_date_state$cum_d_avd_q975)], 
+                rev(its_boots_date_state$cum_d_avd_q025),
+                its_boots_date_state$cum_d_avd_q025[1]),
+          col = adjustcolor("royalblue", alpha.f = 0.4),
+          #fillOddEven = T,
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = its_boots_date_state$cum_d_avd_md,
+        col = "royalblue")
+  
+dev.off()  
+```
+
+###### Divide up panels for health affairs submission  
+
+```{r bp1A_save, message=F, include=F, warning=F}
+# png(here::here("plots/baseplot_outcomes_averted.png"),
+#                width = 7, height = 8, units = "in", res = 300)
+pdf(here::here("plots/baseplot_weekly_cases.pdf"),
+                width = 6, height = 4)
+par(mgp = c(1.6,0.5,0),
+    las = 1,
+    tcl = -0.2,
+    xaxs = "r", yaxs = "i")
+
+par(mar = c(2,4,1,1.2))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,140000),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10,12)*10000,
+       labels = c("0", paste0(c(20, 40, 60, 80,100,120), "k")))
+  mtext("Weekly Cases", side = 2, line = 2.2, las = 0)
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = c("Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct"))
+  legend("topleft",
+         pch = 15,
+         col = c("royalblue", "lightblue","lightgreen","darkgreen"),
+         legend = c("Q1", "Q2", "Q3", "Q4"),
+         title = "VEM Quartile",
+         bty = "n")
+  legend("top",
+         fill = "royalblue",
+         border = "royalblue",
+         legend = "Q1-Averted",
+         density = c(30,30),
+         angle = c(45, 360-45),
+         bty = "n")
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$c_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$c_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+
+
+dev.off()  
+
+write_csv(bind_rows(weekly_state_vem_sum %>% 
+                      pivot_longer(cases:deaths, names_to = "outcome") %>% 
+                      mutate(type = "observed"),
+                    weekly_state_avd_sum %>% 
+                      dplyr::select(date, vemquartile, 
+                                    "cases" = c_avd_md, 
+                                    "hosps" = h_avd_md, 
+                                    "deaths" = d_avd_md) %>% 
+                      pivot_longer(cases:deaths, names_to = "outcome") %>% 
+                      mutate(type = "counterfactual")),
+          here::here("data/ExhibitData/exhibit2_data.csv"))
+```
+
+```{r bp1B_save, message=F, include=F, warning=F}
+png(here::here("plots/baseplot_weekly_hospitalizations.png"),
+                width = 6, height = 4, units = "in", res = 300)
+par(mgp = c(1.6,0.5,0),
+    las = 1,
+    tcl = -0.2,
+    xaxs = "r", yaxs = "i")
+
+# B1 - Hospitalizations averted figure ---------------------
+par(mar = c(2,4,1,1.2))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,max(its_boots_state$cum_h_avd_mn)+400),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10,12)*1000,
+       labels = c("0", paste0(c(2, 4, 6, 8,10,12), "k")))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = c("Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct"))
+  legend("topleft",
+         pch = 15,
+         col = c("royalblue", "lightblue","lightgreen","darkgreen"),
+         legend = c("Q1", "Q2", "Q3", "Q4"),
+         title = "VEM Quartile",
+         bty = "n")
+  legend("top",
+         fill = "royalblue",
+         border = "royalblue",
+         legend = "Q1-Averted",
+         density = c(30,30),
+         angle = c(45, 360-45),
+         bty = "n")
+
+  mtext("Weekly Hospitalizations", side = 2, line = 2.2, las = 0)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+
+dev.off()
+```
+
+```{r bp1C_save, message=F, include=F, warning=F}
+png(here::here("plots/baseplot_weekly_deaths.png"),
+                width = 6, height = 4, units = "in", res = 300)
+par(mgp = c(1.6,0.5,0),
+    las = 1,
+    tcl = -0.2,
+    xaxs = "r", yaxs = "i")
+
+# C1 - Deaths averted figure ---------------------
+par(mar = c(2,4,1,1.2))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,1300),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10,12)*100,
+       labels = c("0", "200", "400", "600", "800", "1000", "1200"))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = c("Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct"))
+  legend("topleft",
+         pch = 15,
+         col = c("royalblue", "lightblue","lightgreen","darkgreen"),
+         legend = c("Q1", "Q2", "Q3", "Q4"),
+         title = "VEM Quartile",
+         bty = "n")
+  legend("top",
+         fill = "royalblue",
+         border = "royalblue",
+         legend = "Q1-Averted",
+         density = c(30,30),
+         angle = c(45, 360-45),
+         bty = "n")
+  mtext("Weekly Deaths", side = 2, line = 2.2, las = 0)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+  
+  
+dev.off()
+```
+
+```{r bp1D_save, message=F, include=F, warning=F}
+pdf(here::here("plots/baseplot_cases_averted.pdf"),
+                width = 6, height = 4)
+par(mgp = c(1.6,0.5,0),
+    las = 1,
+    tcl = -0.2,
+    xaxs = "r", yaxs = "i")
+
+par(mar = c(2,4.4,1,1))
+plot(x = its_boots_date_state$date,
+     y = its_boots_date_state$cum_c_avd_md,
+     ylim = c(0, 240000),
+     type = "n",
+     col = "royalblue",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "n")
+  axis(2,
+       at = c(0, 40, 80, 120, 160,200,240)*1000,
+       labels = c("0", paste0(c(40, 80, 120, 160,200,240), "k")))
+  mtext("Cumulative Cases\nAverted in VEM Q1", side = 2, line = 2.5, las = 0)
+  axis(1,
+       at = seq.Date(policy_date, its_end_date, by = "1 month"),
+       labels = c("Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", " "))
+  axis(1,
+       at = seq.Date(policy_date-30, its_end_date-7, by = "1 month"),
+       labels = F, tick = F)
+  # mtext("Cumulative cases averted (10,000s)",
+  #       side = 4, line = 1.6, las = 0)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date),
+                min(its_boots_date_state$date)), 
+          y = c(its_boots_date_state$cum_c_avd_q975[1],
+                its_boots_date_state$cum_c_avd_q975,
+                its_boots_date_state$cum_c_avd_q025[length(its_boots_date_state$cum_c_avd_q975)], 
+                rev(its_boots_date_state$cum_c_avd_q025),
+                its_boots_date_state$cum_c_avd_q025[1]),
+          col = adjustcolor("royalblue", alpha.f = 0.4),
+          #fillOddEven = T,
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = its_boots_date_state$cum_c_avd_md,
+        col = "royalblue")
+  
+  
+dev.off()  
+```
+
+```{r bp1_print}
+#[Outcomes averted summary figure](../plots/baseplot_outcomes_averted.png)
+par(mfrow = c(3,2),
+    mgp = c(1.6,0.5,0),
+    las = 1,
+    tcl = -0.2,
+    xaxs = "r", yaxs = "i")
+
+# A1 - Cases averted figure -----------------------------
+par(mar = c(2,3,1,0.1))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,120000),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  mtext("A", adj = -0.1, line = -1, cex = 1.5)
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10)*10000,
+       labels = c(0, 2, 4, 6, 8,10))
+  mtext("Cases (10,000s)", side = 2, line = 1.5, las = 0)
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = rep("", 8))
+  legend("topleft",
+         pch = 15,
+         col = c("royalblue", "lightblue","lightgreen","darkgreen"),
+         legend = c("Q1", "Q2", "Q3", "Q4"),
+         title = "VEM Quartile",
+         bty = "n")
+  legend("top",
+         fill = "royalblue",
+         border = "royalblue",
+         legend = "Q1-Averted",
+         density = c(30,30),
+         angle = c(45, 360-45),
+         bty = "n")
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$c_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$c_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$cases[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+# A2 - Cumulative cases averted ----------------
+par(mar = c(2,0.1,1,3))
+plot(x = its_boots_date_state$date,
+     y = its_boots_date_state$cum_c_avd_md,
+     ylim = c(0, 140000),
+     type = "n",
+     col = "royalblue",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "n")
+  axis(4,
+       at = c(0, 2, 4, 6, 8,10,12,14)*10000,
+       labels = c(0, 2, 4, 6, 8,10,12,14))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date, by = "1 month"),
+       labels = rep("", 9))
+  # mtext("Cumulative cases averted (10,000s)",
+  #       side = 4, line = 1.6, las = 0)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date),
+                min(its_boots_date_state$date)), 
+          y = c(its_boots_date_state$cum_c_avd_q975[1],
+                its_boots_date_state$cum_c_avd_q975,
+                its_boots_date_state$cum_c_avd_q025[length(its_boots_date_state$cum_c_avd_q975)], 
+                rev(its_boots_date_state$cum_c_avd_q025),
+                its_boots_date_state$cum_c_avd_q025[1]),
+          col = adjustcolor("royalblue", alpha.f = 0.4),
+          #fillOddEven = T,
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = its_boots_date_state$cum_c_avd_md,
+        col = "royalblue")
+  
+# B1 - Hospitalizations averted figure ---------------------
+par(mar = c(2,3,1,0.1))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,max(its_boots_state$cum_h_avd_mn)+200),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  mtext("B", adj = -0.1, line = -0.3, cex = 1.5)
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10)*1000,
+       labels = c(0, 2, 4, 6, 8,10))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = rep("", 8))
+  mtext("Hospitalizations (1,000s)", side = 2, line = 1.5, las = 0)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+
+# B2 - Cumulative hospitalizations averted ----------------
+par(mar = c(2,0.1,1,3))
+plot(x = its_boots_date_state$date,
+     y = its_boots_date_state$cum_h_avd_md,
+     ylim = c(0, 10000),
+     type = "n",
+     col = "royalblue",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "n")
+  axis(4,
+       at = c(0, 2, 4, 6, 8,10,12,14)*1000,
+       labels = c(0, 2, 4, 6, 8,10,12,14))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date, by = "1 month"),
+       labels = rep("", 9))
+  mtext("Cumulative averted",
+        side = 4, line = 1.6, las = 0)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date),
+                min(its_boots_date_state$date)), 
+          y = c(its_boots_date_state$cum_h_avd_q975[1],
+                its_boots_date_state$cum_h_avd_q975,
+                its_boots_date_state$cum_h_avd_q025[length(its_boots_date_state$cum_h_avd_q975)], 
+                rev(its_boots_date_state$cum_h_avd_q025),
+                its_boots_date_state$cum_h_avd_q025[1]),
+          col = adjustcolor("royalblue", alpha.f = 0.4),
+          #fillOddEven = T,
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = its_boots_date_state$cum_h_avd_md,
+        col = "royalblue")
+  
+# C1 - Deaths averted figure ---------------------
+par(mar = c(2,3,1,0.1))
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,1200),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "L")
+  mtext("C", adj = -0.1, line = -0.3, cex = 1.5)
+  axis(2,
+       at = c(0, 2, 4, 6, 8,10)*100,
+       labels = c(0, 2, 4, 6, 8,10))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date-7, by = "1 month"),
+       labels = c("Mar 1", "Apr 1", "May 1", "Jun 1", "Jul 1", "Aug 1", "Sep 1", "Oct 1"))
+  mtext("Mortalities (100s)", side = 2, line = 1.5, las = 0)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 20,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+  
+  
+# C2 - Cumulative hospitalizations averted ----------------
+par(mar = c(2,0.1,1,3))
+plot(x = its_boots_date_state$date,
+     y = its_boots_date_state$cum_d_avd_md,
+     ylim = c(0, 1000),
+     type = "n",
+     col = "royalblue",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n",
+     bty = "n")
+  axis(4,
+       at = c(0, 2, 4, 6, 8,10,12,14)*100,
+       labels = c(0, 2, 4, 6, 8,10,12,14))
+  axis(1,
+       at = seq.Date(policy_date, its_end_date, by = "1 month"),
+       labels = c("Mar 1", "Apr 1", "May 1", "Jun 1", "Jul 1", "Aug 1", "Sep 1", "Oct 1", "Nov 1"))
+  # mtext("Cumulative mortalities averted (100s)",
+  #       side = 4, line = 1.6, las = 0)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date),
+                min(its_boots_date_state$date)), 
+          y = c(its_boots_date_state$cum_d_avd_q975[1],
+                its_boots_date_state$cum_d_avd_q975,
+                its_boots_date_state$cum_d_avd_q025[length(its_boots_date_state$cum_d_avd_q975)], 
+                rev(its_boots_date_state$cum_d_avd_q025),
+                its_boots_date_state$cum_d_avd_q025[1]),
+          col = adjustcolor("royalblue", alpha.f = 0.4),
+          #fillOddEven = T,
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = its_boots_date_state$cum_d_avd_md,
+        col = "royalblue")
+
+```
+
+
+
+
+## Model performance table   
+
+```{r mod_performance_table_setup}
+mod_prfrm <- readRDS(here::here("data/mods_mean_mses.rds"))
+
+mods <- mod_prfrm$forms
+
+mods <- gsub("bs(t_wk, knots = seq(min(its_df_quarts$t_wk), max(its_df_quarts$t_wk), by = 3))", "spline", mods, fixed = T)
+mods <- gsub("factor(vemquartile, levels = c('4', '3', '2', '1'))", "VEM", mods, fixed = T)
+mods <- gsub("county + spline + VEM + int", "BASE", mods, fixed = T)
+#mods <- gsub("BASE+","BASE+\n", mods, fixed = T)
+
+mod_prfrm_cases_mean <- rowMeans(mod_prfrm$case_mses)
+mod_prfrm_cases_min <- apply(mod_prfrm$case_mses,1,min)
+mod_prfrm_cases_max <- apply(mod_prfrm$case_mses,1,max)
+mod_prfrm_cases_sum <- paste0(round(mod_prfrm_cases_mean), " (",
+                              round(mod_prfrm_cases_min), " - ",
+                              round(mod_prfrm_cases_max), ")")
+
+mod_prfrm_hosps_mean <- rowMeans(mod_prfrm$hosp_mses)
+mod_prfrm_hosps_min <- apply(mod_prfrm$hosp_mses,1,min)
+mod_prfrm_hosps_max <- apply(mod_prfrm$hosp_mses,1,max)
+mod_prfrm_hosps_sum <- paste0(round(mod_prfrm_hosps_mean,2), " (",
+                              round(mod_prfrm_hosps_min,2), " - ",
+                              round(mod_prfrm_hosps_max,2), ")")
+
+mod_prfrm_morts_mean <- rowMeans(mod_prfrm$mort_mses)
+mod_prfrm_morts_min <- apply(mod_prfrm$mort_mses,1,min)
+mod_prfrm_morts_max <- apply(mod_prfrm$mort_mses,1,max)
+mod_prfrm_morts_sum <- paste0(round(mod_prfrm_morts_mean,3), " (",
+                              round(mod_prfrm_morts_min,3), " - ",
+                              round(mod_prfrm_morts_max,3), ")")
+
+top_mods <- readRDS(here::here("data/bootstrap_top_mods_SA100.rds"))
+
+top_mods_sum <- top_mods %>% 
+  group_by(mod, outcome) %>% 
+  summarise(across(obs:avoided, 
+            .fns = list(
+              mn = ~mean(.x),
+              md = ~median(.x),
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+
+top_mods_sum$mod <- gsub("bs(t_wk, knots = seq(min(its_df_quarts$t_wk), max(its_df_quarts$t_wk), by = 3))", "spline", top_mods_sum$mod, fixed = T)
+top_mods_sum$mod <- gsub("factor(vemquartile, levels = c('4', '3', '2', '1'))", "VEM", top_mods_sum$mod, fixed = T)
+top_mods_sum$mod <- gsub("county + spline + VEM + int", "BASE", top_mods_sum$mod, fixed = T)
+
+```
+
+`r mods[which.min(mod_prfrm_cases_mean)]` (`r which.min(mod_prfrm_cases_mean)`) was best performing cases model
+
+`r mods[which.min(mod_prfrm_hosps_mean)]` (`r which.min(mod_prfrm_hosps_mean)`) was best performing hospitalizations model
+
+`r mods[which.min(mod_prfrm_morts_mean)]` (`r which.min(mod_prfrm_morts_mean)`) was best performing mortalities model
+
+```{r mod_performance_table_all}
+mod_prfrm_tbl <- as_tibble(cbind(mods, 
+                                 mod_prfrm_cases_sum,
+                                 mod_prfrm_hosps_sum,
+                                 mod_prfrm_morts_sum))
+
+mod_prfrm_tbl <- mod_prfrm_tbl[order(mod_prfrm_cases_mean),]
+
+
+mod_prfrm_tbl %>% 
+  knitr::kable(col.names = c("Model Terms", "Cases MSE (range)", "Hospitalizations MSE (range)", "Mortalities MSE (range)"))
+```
+
+```{r mod_performance_table_cases}
+mod_prfrm_cases_tbl <- as_tibble(cbind(mods, mod_prfrm_cases_sum))
+
+mod_prfrm_cases_tbl <- mod_prfrm_cases_tbl[order(mod_prfrm_cases_mean),]
+
+mod_prfrm_cases_tbl <- mod_prfrm_cases_tbl %>% 
+  left_join(top_mods_sum %>% 
+              filter(outcome == "cases") %>% 
+              mutate(cases_avd_sum = paste0(round(avoided_md), " (",
+                                            round(avoided_q025), " - ",
+                                            round(avoided_q975), ")")) %>% 
+              dplyr::select(mod, cases_avd_sum), 
+            by = c("mods" = "mod"))
+
+# Best performing model numbers from results above (only 2-10 performing models in top_mods)
+mod_prfrm_cases_tbl$cases_avd_sum[1] <- paste0(round(cases_its_avd_md), " (",
+                                               round(cases_its_avd_lo), " - ",
+                                               round(cases_its_avd_hi), ")")
+
+mod_prfrm_cases_tbl %>% 
+  knitr::kable(col.names = c("Model Terms", "Cases MSE (range)", "Estimated Cases Avoided* (95%CI)"))
+```
+
+```{r mod_performance_table_hosps}
+mod_prfrm_hosps_tbl <- as_tibble(cbind(mods, mod_prfrm_hosps_sum))
+
+mod_prfrm_hosps_tbl <- mod_prfrm_hosps_tbl[order(mod_prfrm_hosps_mean),]
+
+mod_prfrm_hosps_tbl <- mod_prfrm_hosps_tbl %>% 
+  left_join(top_mods_sum %>% 
+              filter(outcome == "hosps") %>% 
+              mutate(hosps_avd_sum = paste0(round(avoided_md), " (",
+                                            round(avoided_q025), " - ",
+                                            round(avoided_q975), ")")) %>% 
+              dplyr::select(mod, hosps_avd_sum), 
+            by = c("mods" = "mod"))
+
+# Best performing model numbers from results above (only 2-10 performing models in top_mods)
+mod_prfrm_hosps_tbl$hosps_avd_sum[1] <- paste0(round(hosps_its_avd_md), " (",
+                                               round(hosps_its_avd_lo), " - ",
+                                               round(hosps_its_avd_hi), ")")
+
+mod_prfrm_hosps_tbl %>% 
+  knitr::kable(col.names = c("Model Terms", "Hospitalizations MSE (range)", "Estimated Hospitalizations Avoided* (95%CI)"))
+```
+
+```{r mod_performance_table_morts}
+mod_prfrm_morts_tbl <- as_tibble(cbind(mods, mod_prfrm_morts_sum))
+
+mod_prfrm_morts_tbl <- mod_prfrm_morts_tbl[order(mod_prfrm_morts_mean),]
+
+mod_prfrm_morts_tbl <- mod_prfrm_morts_tbl %>% 
+  left_join(top_mods_sum %>% 
+              filter(outcome == "deaths") %>% 
+              mutate(morts_avd_sum = paste0(round(avoided_md), " (",
+                                            round(avoided_q025), " - ",
+                                            round(avoided_q975), ")")) %>% 
+              dplyr::select(mod, morts_avd_sum), 
+            by = c("mods" = "mod"))
+
+# Best performing model numbers from results above (only 2-10 performing models in top_mods)
+mod_prfrm_morts_tbl$morts_avd_sum[1] <- paste0(round(deaths_its_avd_md), " (",
+                                               round(deaths_its_avd_lo), " - ",
+                                               round(deaths_its_avd_hi), ")")
+
+mod_prfrm_morts_tbl %>% 
+  knitr::kable(col.names = c("Model Terms", "Mortalities MSE (range)", "Estimated Deaths Avoided* (95%CI)"))
+```
+
+## Scratch  
+
+### Octiles Sensitivity Analysis  
+
+```{r oct_sa_res, eval = F}
+oct_sa <- readRDS(here::here("data/bootstrapped_outcomes_avoided_octsSA10000.rds"))
+
+oct_sa <- oct_sa %>% 
+  group_by(iter, county, vemoctile) %>% 
+  arrange(iter, county, vemoctile, date) %>% 
+  mutate(across(c_avd:d_avd, cumsum, .names = "cum_{.col}")) %>% 
+  ungroup()
+
+oct_sa_cnty_date <- oct_sa %>% 
+  filter(date >= policy_date) %>% 
+  group_by(county, vemoctile, date) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = ~mean(.x),
+              md = ~median(.x),
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            ))) %>% 
+  left_join(cnty_pop, by = "county") %>% 
+  mutate(across(cum_c_avd_mn:cum_d_avd_q975, 
+                .fns = ~.x/pop*1e5,
+                .names = "{.col}_p100k"))
+
+oct_sa_cnty_vem <- oct_sa %>% 
+  filter(date >= (its_end_date-8)) %>% 
+  group_by(county, vemoctile) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = ~mean(.x),
+              md = ~median(.x),
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+
+oct_sa_cnties <- oct_sa_cnty_vem %>% group_by(county) %>% summarise(n = n()) %>% filter(n == 2) %>% pull(county)
+
+its_q12_cnties[!its_q12_cnties %in% oct_sa_cnties]
+
+oct_sa_state_date <- oct_sa %>% 
+  filter(vemoctile == 2, date >= policy_date) %>% 
+  group_by(date, iter) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, sum)) %>% 
+  ungroup() %>% 
+  group_by(date) %>% 
+  summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+
+oct_sa_state <- oct_sa %>% 
+  filter(date >= (its_end_date-8), vemoctile == 2) %>% 
+  group_by(iter) %>% 
+  summarise(date = first(date),
+            across(cum_c_avd:cum_d_avd, sum)) %>% 
+  ungroup() %>% 
+  group_by(date) %>% 
+    summarise(across(cum_c_avd:cum_d_avd, 
+            .fns = list(
+              mn = mean,
+              md = median,
+              q025 = ~quantile(.x, 0.025),
+              q25 = ~quantile(.x, 0.25),
+              q75 = ~quantile(.x, 0.75),
+              q975 = ~quantile(.x, 0.975)
+            )))
+
+```
+
+```{r oct_sa_sum, eval = F}
+cases_oct_sa_avd_md <- oct_sa_state$cum_c_avd_md
+cases_oct_sa_avd_lo <- oct_sa_state$cum_c_avd_q025
+cases_oct_sa_avd_hi <- oct_sa_state$cum_c_avd_q975
+
+hosps_oct_sa_avd_md <- oct_sa_state$cum_h_avd_md
+hosps_oct_sa_avd_lo <- oct_sa_state$cum_h_avd_q025
+hosps_oct_sa_avd_hi <- oct_sa_state$cum_h_avd_q975
+
+deaths_oct_sa_avd_md <- oct_sa_state$cum_d_avd_md
+deaths_oct_sa_avd_lo <- oct_sa_state$cum_d_avd_q025
+deaths_oct_sa_avd_hi <- oct_sa_state$cum_d_avd_q975
+
+```
+
+```{r}
+#Restricting the counterfactual estimation procedure to VEM octiles 2 and 3 led to attenuated and highly uncertain estimates of the number of outcomes avoided. In this sensitivity analysis, `r round(cases_oct_sa_avd_md)` (95%CI: `r round(cases_oct_sa_avd_lo)` - `r round(cases_oct_sa_avd_hi)`) cases, `r round(hosps_oct_sa_avd_md)` (95%CI: `r round(hosps_oct_sa_avd_lo)` - `r round(hosps_oct_sa_avd_hi)`) hospitalizations, and `r round(deaths_oct_sa_avd_md)` (95%CI: `r round(deaths_oct_sa_avd_lo)` - `r round(deaths_oct_sa_avd_hi)`) deaths were estimated to have been averted in VEM octile 2 zip codes. However, it should also be noted that model performance in this subset of zip codes was poor relative to the full dataset. Furthermore, ten counties were excluded from this sensitivity analysis altogether since they lacked zip codes that fall into both VEM octile 2 and 3.
+
+```
+
+### GGplot Fig 1   
+```{r fin_fig_6panel, fig.height=8, fig.width=10, fig.cap="Cumulative cases (A), hospitalizations (C), and deaths (E) averted by week from March 1, 2021 when the vaccine equity allocation was implemented through the end of August 2021. Solid lines indicate the median and shading the 95% credible intervals from 10,000 non-parametric bootstrapping samples of zip codes. Cumulative cases (B), hospitalizations (D) and mortalities (F) per 100,000 by county at the end of the time period. Points are symbolized according to county population and show the median from 10,000 bootstrapped replicates. Error bars represent the 95% credible intervals from bootstrapped replicates."}
+library(patchwork)
+
+(cases_avd_ts_fig | case_avd_cnty_fig) / (hosps_avd_ts_fig | hosp_avd_cnty_fig) / (deaths_avd_ts_fig | death_avd_cnty_fig)
+
+ggsave(here::here("plots/outcomes_avoided_6panel.jpg"), 
+       units = "in", height = 8, width = 10, dpi = 300)
+
+```
+
+### Vax avd corr   
+
+```{r vax_avd_county_corr, eval = F}
+vem1_vax_rate_change <- zip_fin %>% 
+    filter(date >= (policy_date-28) & date <= (policy_date+21)) %>%  
+    mutate(after = if_else(date < policy_date, 0, 1),
+           int = if_else(vemquartile == 1, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax = sum(vax),
+              pop = first(popTOT)) %>% # Up to here constucts the diff in diff analysis dataframe, the following then gets raw change in vaccination rate from before intervention period to after intervention period
+  filter(int == 1) %>% 
+  mutate(vemquartile = 1,
+         befaft = if_else(after == 1, "after", "before")) %>% 
+  dplyr::select(zip, county, vemquartile, befaft, vax, pop) %>% 
+  pivot_wider(names_from = befaft, values_from = c("vax", "pop")) %>% 
+  group_by(county, vemquartile) %>% 
+  summarise(vax_before = sum(vax_before),
+            vax_after = sum(vax_after),
+            pop = sum(pop_before)) %>% 
+  ungroup() %>% 
+  mutate(rate_before = vax_before/pop*1e5,
+         rate_after = vax_after/pop*1e5,
+         rate_change = rate_after - rate_before,
+         pop_wt = pop/vem_pop$pop[vem_pop$vemquartile == 1])
+
+cnty_outcomesavd_ratechange_df <- its_boots_cnty_vem %>% 
+  filter(vemquartile == 1) %>% 
+  left_join(vem1_vax_rate_change %>% dplyr::select(-pop), by = c("county", "vemquartile"))
+
+vem1_vax_rate_change_clm <- lm(cum_c_avd_md_p100k~rate_change, 
+                               weights = pop_wt,
+                               data = cnty_outcomesavd_ratechange_df)
+
+vem1_vax_rate_change_hlm <- lm(cum_h_avd_md_p100k~rate_change, 
+                               weights = pop_wt,
+                               data = cnty_outcomesavd_ratechange_df)
+
+vem1_vax_rate_change_dlm <- lm(cum_d_avd_md_p100k~rate_change, 
+                               weights = pop_wt,
+                               data = cnty_outcomesavd_ratechange_df)
+
+cnty_outcomesavd_ratechange_df$pred_c_avd_rate_change <- predict(vem1_vax_rate_change_clm, newdata = cnty_outcomesavd_ratechange_df)
+cnty_outcomesavd_ratechange_df$pred_h_avd_rate_change <- predict(vem1_vax_rate_change_hlm, newdata = cnty_outcomesavd_ratechange_df)
+cnty_outcomesavd_ratechange_df$pred_d_avd_rate_change <- predict(vem1_vax_rate_change_dlm, newdata = cnty_outcomesavd_ratechange_df)
+
+cnty_ratechange_cases_fig <- cnty_outcomesavd_ratechange_df %>% 
+  ggplot(aes(x = rate_change)) +
+    geom_point(aes(y = cum_c_avd_md_p100k), col = "goldenrod2") +
+    geom_line(aes(y = pred_c_avd_rate_change), lty = 2, col = "goldenrod2") +
+    theme_classic()
+
+cnty_ratechange_hosps_fig <- cnty_outcomesavd_ratechange_df %>% 
+  ggplot(aes(x = rate_change)) +
+    geom_point(aes(y = cum_h_avd_md_p100k), col = "darkorange3") +
+    geom_line(aes(y = pred_h_avd_rate_change), lty = 2, col = "darkorange3") +
+    theme_classic()
+
+cnty_ratechange_deaths_fig <- cnty_outcomesavd_ratechange_df %>% 
+  ggplot(aes(x = rate_change)) +
+    geom_point(aes(y = cum_d_avd_md_p100k), col = "firebrick3") +
+    geom_line(aes(y = pred_d_avd_rate_change), lty = 2, col = "firebrick3") +
+    theme_classic()
+```
+
+```{r its_est_by_vem, eval = F}
+# Mostly a sanity check since estimates in other VEM quartiles should be mean 0
+its_boots_date_state_vem  %>% 
+  ggplot() +
+    geom_ribbon(aes(x = date, ymin = cum_c_avd_q25, ymax = cum_c_avd_q75, fill = as.factor(vemquartile)), alpha = 0.3) +
+    geom_line(aes(x = date, y = cum_c_avd_md, col = as.factor(vemquartile))) +
+    #geom_line(aes(x = date, y = cum_c_avd_q25), lty = 3) +
+    #geom_line(aes(x = date, y = cum_c_avd_q75), lty = 3) +
+    theme_minimal() +
+    theme_here() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10)) +
+    scale_x_date(date_breaks = "1 month", date_labels = "%b '%y") +
+    scale_color_hpiq() +
+    scale_fill_hpiq() +
+    labs(x = "",
+         y = "Cases averted")
+
+```
+
+```{r bp2, eval = FALSE}
+bpc <- barplot(-its_boots_date_state$cum_c_avd_md, 
+               axes = F,
+               ylim = c(-max(its_boots_date_state$cum_c_avd_q975),0))
+  arrows(x0 = bpc,
+         y0 = -its_boots_date_state$cum_c_avd_q025,
+         y1 = -its_boots_date_state$cum_c_avd_q975,
+         angle = 90,
+         code = 3,
+         length = 0.01)
+  axis(3,
+       line = 1,
+       at = c(0,5,11,17,22,27,32),
+       labels = NA)
+  axis(4, 
+       at = c(0, -40000, -80000, -120000),
+       labels = c(0,4,8,12))
+  mtext("Cumulative Cases\nAverted (10,000s)", side = 4, line = 3)
+```
+
+
+```{r bp3, eval = FALSE}
+# Cumulative cases avoided plot ----------------------------  
+par(las=1)
+  
+plot(x = its_boots_date_state$date,
+     y = rep(0, length(its_boots_date_state$date)),
+     ylim = c(-max(its_boots_date_state$cum_c_avd_q975),0),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n")
+  axis(4)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date)),
+          y = -c(its_boots_date_state$cum_c_avd_q025[1],
+                its_boots_date_state$cum_c_avd_q975,
+                its_boots_date_state$cum_c_avd_q025[end_wk_ind],
+                rev(its_boots_date_state$cum_c_avd_q025)),
+          col = "grey80",
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = -its_boots_date_state$cum_c_avd_md)
+
+  
+# Hospitalization incidence by VEM plot   -----------------------
+  
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,max(its_boots_state$cum_h_avd_mn)+max(weekly_state_avd_sum$h_avd_mn)),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n")
+  axis(2)
+  mtext("B", adj = -0.2, line = 1, cex = 1.5)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 10,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$h_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$hosps[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 10,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+  
+  
+
+# cumulative hospitalizations avoided plot ------------------------
+plot(x = its_boots_date_state$date,
+     y = rep(0, length(its_boots_date_state$date)),
+     ylim = c(-max(its_boots_date_state$cum_h_avd_q975),0),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n")
+  axis(4)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date)),
+          y = -c(its_boots_date_state$cum_h_avd_q025[1],
+                its_boots_date_state$cum_h_avd_q975,
+                its_boots_date_state$cum_h_avd_q025[end_wk_ind],
+                rev(its_boots_date_state$cum_h_avd_q025)),
+          col = "grey80",
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = -its_boots_date_state$cum_h_avd_md)
+
+# Mortalities incidence by VEM plot   -----------------------
+  
+plot(x = weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1], 
+     y = rep(0, length(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])),
+     ylim = c(0,1200),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n")
+  axis(2)
+  mtext("C", adj = -0.2, line = 1, cex = 1.5)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 4])), 
+          y = c(0,
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                0),
+          col = "darkgreen",
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 3])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1]),
+          col = "lightgreen",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 2])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1]),
+          col = "lightblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1]),
+          col = "royalblue",
+          #fillOddEven = T,
+          border = F)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 10,
+          angle = 360-45,
+          #fillOddEven = T,
+          border = T)
+  polygon(x = c(min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1],
+                max(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                rev(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1]),
+                min(weekly_state_vem_sum$date[weekly_state_vem_sum$vemquartile == 1])), 
+          y = c(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1],
+                weekly_state_avd_sum$d_avd_md[weekly_state_avd_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4],
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][end_wk_ind] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][end_wk_ind] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][end_wk_ind], 
+                rev(weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2] +
+                      weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1]),
+                weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 4][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 3][1] + 
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 2][1] +
+                  weekly_state_vem_sum$deaths[weekly_state_vem_sum$vemquartile == 1][1]),
+          col = "royalblue",
+          density = 10,
+          angle = 45,
+          #fillOddEven = T,
+          border = T)
+  
+  
+
+# Cumulative mortalities avoided plot --------------------
+plot(x = its_boots_date_state$date,
+     y = rep(0, length(its_boots_date_state$date)),
+     ylim = c(-max(its_boots_date_state$cum_d_avd_q975),0),
+     type = "n",
+     ylab = "",
+     xlab = "",
+     yaxt = "n",
+     xaxt = "n")
+  axis(4)
+  polygon(x = c(min(its_boots_date_state$date),
+                its_boots_date_state$date,
+                max(its_boots_date_state$date),
+                rev(its_boots_date_state$date)),
+          y = -c(its_boots_date_state$cum_d_avd_q025[1],
+                its_boots_date_state$cum_d_avd_q975,
+                its_boots_date_state$cum_d_avd_q025[end_wk_ind],
+                rev(its_boots_date_state$cum_d_avd_q025)),
+          col = "grey80",
+          border = F)
+  lines(x = its_boots_date_state$date,
+        y = -its_boots_date_state$cum_d_avd_md)
+```
+
+```{r bp4, eval = FALSE}
+par(las=1)
+bpc <- barplot(-its_boots_date_state$cum_c_avd_md, 
+               axes = F,
+               ylim = c(-max(its_boots_date_state$cum_c_avd_q975),0))
+  arrows(x0 = bpc,
+         y0 = -its_boots_date_state$cum_c_avd_q025,
+         y1 = -its_boots_date_state$cum_c_avd_q975,
+         angle = 90,
+         code = 3,
+         length = 0.01)
+  axis(3,
+       line = 1,
+       at = c(0,6,10,15,20,25,30),
+       labels = NA)
+  axis(4, 
+       at = c(0, -40000, -80000, -120000),
+       labels = c(0,4,8,12))
+
+
+
+```

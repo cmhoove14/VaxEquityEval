@@ -1,0 +1,539 @@
+---
+title: "Equity Allocation Impact Evaluation"
+author: "Chris Hoover et al"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(splines)
+library(lme4)
+library(sandwich)
+library(msm)
+
+options(knitr.kable.NA = '',
+        scipen = 999) # prevent scientific notation in printing
+
+source(here::here("Analysis/01-Setup.R"))
+```
+
+# Background  
+As part of the State of California's focus on health equity, vaccine allocation as of March 2, 2021 was determined by the Vaccine Equity Metric (VEM), derived from the Healthy Places Index. Specifically, zip codes in the lowest HPI quartile received double the allotment of vaccines as other quartiles. [Additional measures](https://www.gov.ca.gov/wp-content/uploads/2021/03/Equitable-Vaccine-Administration-Fact-Sheet.pdf) to ensure that vaccines alloted to these areas were administered to residents rather than more advantaged individuals in neighboring areas were also enacted. This analysis seeks to evaluate the impact of these efforts on vaccination rates as well as key covid-19 outcomes including cases, hospitalizations, and deaths.  
+
+# Effect on vaccinations administered    
+
+## Approach    
+A difference in differences analysis using a poisson mixed effects model with a random intercept for county and main effects for binary hpi quartile 1 status, binary intervention period (before/after `r format(policy_date, "%B %d, %Y")`), and their interaction of the form:
+
+$$\log\mathbf{E}(y_{ij}|\mathbf{X})=\log(N_{ij})+\beta_0+\beta_1Int_{ij}+\beta_2After_{ij}+\beta_3Int_{ij}\times After_{ij}+\beta_4 Cnty_i$$
+
+Where:
+$$\log\mathbf{E}(y_{ij}|\mathbf{X})\sim Pois(\lambda)$$   
+
+$$\alpha\sim\mathcal{N}(0,\sigma^2)$$
+are fitted, where $\exp(\beta_3)$ is the difference in differences (DiD) coefficient--the ratio of rate ratios--indicating the change in vaccination rate in HPI Q1 zip codes compared to non-Q1 zip codes following March 8th.  
+
+\newpage
+
+## Results   
+
+### Parallel trends  
+```{r vax_by_vem}
+
+weekly_zip_sum %>% 
+  filter(date >= ymd(20210101) & date < ymd(20210701)) %>% 
+  group_by(date, vemquartile) %>% 
+  summarise(vax = sum(vax)) %>% 
+    ggplot(aes(x = date, y = vax/1000)) + 
+    geom_line(aes(col = as.factor(vemquartile)),
+              size = 1.2) +
+    scale_color_hpiq() +
+    geom_vline(xintercept = ymd(20210301), lty = 2, col = "grey20", alpha = 0.7) +
+    theme_classic() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_x_date(date_breaks = "2 weeks",
+                 date_labels = "%b-%d") +
+    labs(x = "",
+         y = "Vaccinations administered (1000s)",
+         col = "VEM\nQuartile")
+
+ggsave(here::here("plots/vax_administered_prl_trends.png"),
+       width = 6, height = 4, units = "in")
+```
+
+### Raw vaccination rate pre post   
+```{r vax_raw_results}
+vax_change_df <- weekly_zip_sum %>% 
+    filter(date >= (policy_date-28) & date <= (policy_date+21)) %>%  # Four weeks before and week of intervention plus three weeks after
+    mutate(after = if_else(date < policy_date, 0, 1)) %>% 
+    group_by(after, vemquartile) %>% 
+    summarise(vax = sum(vax)) %>% 
+    ungroup() %>% 
+    left_join(vem_pop, by = "vemquartile") %>% 
+    mutate(vax_rate = vax/pop*1e5,
+           vax_sum = paste0(vax, " (",round(vax_rate),")"))
+
+vax_total_before_after <- sum(vax_change_df$vax)
+
+vax_change_by_vem <- vax_change_df %>% 
+  pivot_wider(names_from = after, values_from = vax_rate, id_cols = vemquartile) %>% 
+  mutate(rate_change = `1` - `0`) %>% 
+  rename("before" = `0`,
+         "after" = `1`)
+
+```
+
+```{r vax1_raw_results}
+vax1_change_df <- weekly_zip_sum %>% 
+    filter(date >= (policy_date-28) & date <= (policy_date+21)) %>%  # Four weeks before and week of intervention plus three weeks after
+    mutate(after = if_else(date < policy_date, 0, 1)) %>% 
+    group_by(after, vemquartile) %>% 
+    summarise(vax1 = sum(vax1)) %>% 
+    ungroup() %>% 
+    left_join(vem_pop, by = "vemquartile") %>% 
+    mutate(vax1_rate = vax1/pop*1e5,
+           vax1_sum = paste0(vax1, " (",round(vax1_rate),")"))
+
+vax1_total_before_after <- sum(vax1_change_df$vax1)
+
+vax1_change_by_vem <- vax1_change_df %>% 
+  pivot_wider(names_from = after, values_from = vax1_rate, id_cols = vemquartile) %>% 
+  mutate(rate_change = `1` - `0`) %>% 
+  rename("before" = `0`,
+         "after" = `1`)
+
+```
+
+Nearly `r round(vax_total_before_after/1e6, 1)` million vaccines were administered in California in the four weeks before and after the vaccine equity allocation on `r format(policy_date, "%B %d, %Y")` (`r format(policy_date-28, "%B %d, %Y")` - `r format(policy_date+21, "%B %d, %Y")`). The vaccination rate per 100,000 in this time period was highest in VEM Q4 and lowest in VEM Q1 (Table 1). However, the vaccination rate increased the most in VEM Q1 following the equity allocation, going from `r round(vax_change_by_vem$before[1])` vaccinations/100,000 in the four weeks before the equity allocation to `r round(vax_change_by_vem$after[1])` vaccinations/100,000 in the four weeks after (Table 1).
+
+
+```{r tab1, caption = "Vaccination rates stratified by VEM quartile in the four weeks before and after the equity allocation"}
+vax_change_df %>% 
+    pivot_wider(names_from = after, values_from = vax_sum, id_cols = vemquartile) %>% 
+    left_join(vem_pop, by = "vemquartile") %>% 
+    relocate(pop, .after = vemquartile) %>% 
+    knitr::kable(col.names = c("VEM Quartile", "Population", "Before", "After"))
+```
+
+
+```{r tab1_vax1, eval = FALSE, caption = "First vaccination rates stratified by VEM quartile in the four weeks before and after the equity allocation"}
+vax1_change_df %>% 
+    pivot_wider(names_from = after, values_from = vax1_sum, id_cols = vemquartile) %>% 
+    left_join(vem_pop, by = "vemquartile") %>% 
+    relocate(pop, .after = vemquartile) %>% 
+    knitr::kable(col.names = c("VEM Quartile", "Population", "Before", "After"))
+```
+
+### Diff in diff and sensitivity analyses  
+
+```{r quartile_diffdiff}
+diffdiff_df <- weekly_zip_sum %>% 
+    filter(date >= (policy_date-28) & date <= (policy_date+21)) %>%  # Four weeks before and week of intervention plus three weeks after
+    mutate(after = if_else(date < policy_date, 0, 1),
+           int = if_else(vemquartile == 1, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax = sum(vax),
+              pop = first(pop))
+  
+    diffdiff <- glm(vax ~ county + after*int,
+                      family = poisson(link = "log"),
+                      offset = log(pop),
+                      #nAGQ = 100,
+                      data = diffdiff_df)
+  
+    diffdiff_cov <- vcovHC(diffdiff, type="HC0")
+    diffdiff_RSE <- sqrt(diag(diffdiff_cov))
+    
+    diffdiff_sum <- bind_cols(summary(diffdiff)$coefficients, "RSE" = diffdiff_RSE)
+    
+    diffdiff_index <- which(names(diffdiff$coefficients) == "after:int")
+    
+    diffdiff_irr <- exp(diffdiff_sum$Estimate[diffdiff_index])
+    diffdiff_irr025 <- exp(diffdiff_sum$Estimate[diffdiff_index]+diffdiff_sum$RSE[diffdiff_index]*qnorm(.025))
+    diffdiff_irr975 <- exp(diffdiff_sum$Estimate[diffdiff_index]+diffdiff_sum$RSE[diffdiff_index]*qnorm(.975))
+    
+    county_indices <- which(grepl("county", names(diffdiff$coefficients)))
+    
+    county_diff_diff_coefs <- bind_cols("county" = str_remove(names(diffdiff$coefficients)[county_indices], "county"),
+                                        diffdiff_sum %>% dplyr::select(Estimate, RSE) %>% slice(county_indices))
+```
+
+```{r firstvax_quartile_diffdiff, eval = FALSE}
+diffdiff_df1 <- weekly_zip_sum %>% 
+    filter(date >= (policy_date-28) & date <= (policy_date+21)) %>%  # Four weeks before and week of intervention plus three weeks after
+    mutate(after = if_else(date < policy_date, 0, 1),
+           int = if_else(vemquartile == 1, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax1 = sum(vax1),
+              pop = first(pop))
+  
+    diffdiff1 <- glm(vax1 ~ county + after*int,
+                      family = poisson(link = "log"),
+                      offset = log(pop),
+                      #nAGQ = 100,
+                      data = diffdiff_df1)
+  
+    diffdiff_cov1 <- vcovHC(diffdiff1, type="HC0")
+    diffdiff_RSE1 <- sqrt(diag(diffdiff_cov1))
+    
+    diffdiff_sum1 <- bind_cols(summary(diffdiff1)$coefficients, "RSE" = diffdiff_RSE1)
+    
+    diffdiff_index1 <- which(names(diffdiff1$coefficients) == "after:int")
+    
+    diffdiff_irr1<- exp(diffdiff_sum1$Estimate[diffdiff_index1])
+    diffdiff1_irr025 <- exp(diffdiff_sum1$Estimate[diffdiff_index1]+diffdiff_sum1$RSE[diffdiff_index1]*qnorm(.025))
+    diffdiff1_irr975 <- exp(diffdiff_sum1$Estimate[diffdiff_index1]+diffdiff_sum1$RSE[diffdiff_index1]*qnorm(.975))
+    
+    county_indices <- which(grepl("county", names(diffdiff1$coefficients)))
+    
+    county_diff_diff_coefs1 <- bind_cols("county" = str_remove(names(diffdiff1$coefficients)[county_indices], "county"),
+                                        diffdiff_sum1 %>% dplyr::select(Estimate, RSE) %>% slice(county_indices))
+```
+
+```{r quartile_diffdiff_pairwise}
+# Function and implementation for pairwise quartile comparisons  
+    
+qtile_diff_diff <- function(q_tgt, q_ctrl, days_bef_aft){
+  
+  diffdiff_df <- weekly_zip_sum %>% 
+    filter(vemquartile %in% c(q_tgt,q_ctrl)) %>% 
+    filter(date >= (policy_date-days_bef_aft) & date <= (policy_date+days_bef_aft-7)) %>%  
+    mutate(after = if_else(date < policy_date, 0, 1),
+           int = if_else(vemquartile == !!q_tgt, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax = sum(vax),
+              pop = first(pop))
+  
+    diffdiff <- glm(vax ~ county + after*int,
+                      family = poisson(link = "log"),
+                      offset = log(pop),
+                      #nAGQ = 100,
+                      data = diffdiff_df)
+  
+    diffdiff_sum <- summary(diffdiff)
+    
+    diffdiff_cov <- vcovHC(diffdiff, type="HC0")
+    diffdiff_RSE <- sqrt(diag(diffdiff_cov))
+    
+    diffdiff_sum <- bind_cols(summary(diffdiff)$coefficients, "RSE" = diffdiff_RSE)
+
+    diffdiff_index <- which(names(diffdiff$coefficients) == "after:int")
+    
+    diffdiff_irr <- exp(diffdiff_sum$Estimate[diffdiff_index])
+    diffdiff_irr025 <- exp(diffdiff_sum$Estimate[diffdiff_index]+diffdiff_sum$RSE[diffdiff_index]*qnorm(.025))
+    diffdiff_irr975 <- exp(diffdiff_sum$Estimate[diffdiff_index]+diffdiff_sum$RSE[diffdiff_index]*qnorm(.975))
+  
+    return(data.frame(qtgt = q_tgt,
+                      qctrl = q_ctrl,
+                      int_pd = days_bef_aft,
+                      irr = diffdiff_irr,
+                      irrlo = diffdiff_irr025,
+                      irrhi = diffdiff_irr975))
+}
+
+# Estimate for all pairwise comparisons and across time frames of 1-4 weeks
+diffdiff_vax_qtiles <- bind_rows(
+  qtile_diff_diff(1,2,56),
+  qtile_diff_diff(1,3,56),
+  qtile_diff_diff(1,4,56),
+  qtile_diff_diff(2,3,56),
+  qtile_diff_diff(2,4,56),
+  qtile_diff_diff(3,4,56),
+  qtile_diff_diff(1,2,28),
+  qtile_diff_diff(1,3,28),
+  qtile_diff_diff(1,4,28),
+  qtile_diff_diff(2,3,28),
+  qtile_diff_diff(2,4,28),
+  qtile_diff_diff(3,4,28),
+  qtile_diff_diff(1,2,21),
+  qtile_diff_diff(1,3,21),
+  qtile_diff_diff(1,4,21),
+  qtile_diff_diff(2,3,21),
+  qtile_diff_diff(2,4,21),
+  qtile_diff_diff(3,4,21),
+  qtile_diff_diff(1,2,14),
+  qtile_diff_diff(1,3,14),
+  qtile_diff_diff(1,4,14),
+  qtile_diff_diff(2,3,14),
+  qtile_diff_diff(2,4,14),
+  qtile_diff_diff(3,4,14),
+  qtile_diff_diff(1,2,7),
+  qtile_diff_diff(1,3,7),
+  qtile_diff_diff(1,4,7),
+  qtile_diff_diff(2,3,7),
+  qtile_diff_diff(2,4,7),
+  qtile_diff_diff(3,4,7)
+)
+
+```
+
+```{r quartile_diffdiff_adj}
+prevax_propvax <- weekly_zip_sum %>% 
+    filter(date == (policy_date-28)) %>%  
+    mutate(prop_unvax = 1-vax_cum/pop,
+           logit_unvax = log(prop_unvax/(1-prop_unvax))) %>% 
+    dplyr::select(zip, prop_unvax, logit_unvax)
+
+  diffdiff_prevax <- weekly_zip_sum %>% 
+    filter(date < policy_date & date >= policy_date-28) %>% 
+    mutate(after = 0,
+           int = if_else(vemquartile == 1, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax = sum(vax),
+              pop = first(pop)) %>% 
+    left_join(prevax_propvax, by = "zip")
+
+posvax_propvax <- weekly_zip_sum %>% 
+    filter(date == policy_date) %>%  
+    mutate(prop_unvax = 1-vax_cum/first(pop),
+           logit_unvax = log(prop_unvax/(1-prop_unvax))) %>% 
+    dplyr::select(zip, prop_unvax, logit_unvax)
+  
+  
+  diffdiff_posvax <- weekly_zip_sum %>% 
+    filter(date < policy_date+21 & date >= policy_date) %>% 
+    mutate(after = 1,
+           int = if_else(vemquartile == 1, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax = sum(vax),
+              pop = first(pop)) %>% 
+    left_join(posvax_propvax, by = "zip")
+
+diffdiff_df_adj <- bind_rows(diffdiff_prevax,diffdiff_posvax)
+
+diffdiff_adj <- glm(vax ~ county + prop_unvax + after*int,
+                          family = poisson(link = "log"),
+                          offset = log(pop),
+                          #nAGQ = 100,
+                          data = diffdiff_df_adj)
+
+    diffdiff_adj_cov <- vcovHC(diffdiff_adj, type="HC0")
+    diffdiff_adj_RSE <- sqrt(diag(diffdiff_adj_cov))
+    
+    diffdiff_adj_sum <- bind_cols(summary(diffdiff_adj)$coefficients, "RSE" = diffdiff_adj_RSE)
+    
+    diffdiff_adj_index <- which(names(diffdiff_adj$coefficients) == "after:int")
+    
+    diffdiff_adj_irr <- exp(diffdiff_adj_sum$Estimate[diffdiff_adj_index])
+    diffdiff_adj_irr025 <- exp(diffdiff_adj_sum$Estimate[diffdiff_adj_index]+diffdiff_adj_sum$RSE[diffdiff_adj_index]*qnorm(.025))
+    diffdiff_adj_irr975 <- exp(diffdiff_adj_sum$Estimate[diffdiff_adj_index]+diffdiff_adj_sum$RSE[diffdiff_adj_index]*qnorm(.975))
+```
+
+
+```{r quartile_diffdiff_adj_pairwise}
+qtile_diff_diff_adj <- function(q_tgt, q_ctrl){
+  
+
+  diffdiff_prevax <- weekly_zip_sum %>% 
+    #st_drop_geometry() %>% 
+    filter(vemquartile %in% c(q_tgt,q_ctrl)) %>% 
+    filter(date < policy_date & date >= policy_date-28) %>% 
+    mutate(after = 0,
+           int = if_else(vemquartile == !!q_tgt, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax = sum(vax),
+              pop = first(pop)) %>% 
+    left_join(prevax_propvax, by = "zip")
+
+  diffdiff_posvax <- weekly_zip_sum %>% 
+    filter(vemquartile %in% c(q_tgt,q_ctrl)) %>% 
+    filter(date < policy_date+28 & date >= policy_date) %>% 
+    mutate(after = 1,
+           int = if_else(vemquartile == q_tgt, 1, 0)) %>% 
+    group_by(zip, after) %>% 
+    summarise(int = first(int),
+              county = first(county),
+              vax = sum(vax),
+              pop = first(pop)) %>% 
+    left_join(posvax_propvax, by = "zip")
+
+diffdiff_df_adj <- bind_rows(diffdiff_prevax,diffdiff_posvax)
+
+diffdiff_adj <- glm(vax ~ county + prop_unvax + after*int,
+                          family = poisson(link = "log"),
+                          offset = log(pop),
+                          #nAGQ = 100,
+                          data = diffdiff_df_adj)
+
+    diffdiff_adj_cov <- vcovHC(diffdiff_adj, type="HC0")
+    diffdiff_adj_RSE <- sqrt(diag(diffdiff_adj_cov))
+    
+    diffdiff_adj_sum <- bind_cols(summary(diffdiff_adj)$coefficients, "RSE" = diffdiff_adj_RSE)
+    
+    diffdiff_adj_index <- which(names(diffdiff_adj$coefficients) == "after:int")
+    
+    diffdiff_adj_irr <- exp(diffdiff_adj_sum$Estimate[diffdiff_adj_index])
+    diffdiff_adj_irr025 <- exp(diffdiff_adj_sum$Estimate[diffdiff_adj_index]+diffdiff_adj_sum$RSE[diffdiff_adj_index]*qnorm(.025))
+    diffdiff_adj_irr975 <- exp(diffdiff_adj_sum$Estimate[diffdiff_adj_index]+diffdiff_adj_sum$RSE[diffdiff_adj_index]*qnorm(.975))
+
+    return(data.frame(qtgt = q_tgt,
+                      qctrl = q_ctrl,
+                      irr = diffdiff_adj_irr,
+                      irrlo = diffdiff_adj_irr025,
+                      irrhi = diffdiff_adj_irr975))
+}
+
+diffdiff_adj_vax_qtiles <- bind_rows(
+  qtile_diff_diff_adj(1,2),
+  qtile_diff_diff_adj(1,3),
+  qtile_diff_diff_adj(1,4),
+  qtile_diff_diff_adj(2,3),
+  qtile_diff_diff_adj(2,4),
+  qtile_diff_diff_adj(3,4)
+)
+
+```
+
+```{r oct_diffdiff}
+oct_diffdiff_df <- weekly_zip_sum %>% 
+  filter(vemoctile %in% c(2,3)) %>% 
+  filter(date >= (policy_date-28) & date <= (policy_date+21)) %>%  
+  mutate(after = if_else(date < policy_date, 0, 1),
+         vemo2 = if_else(vemoctile == 2, 1, 0)) %>% 
+  group_by(zip, after) %>% 
+  summarise(int = first(vemo2),
+            county = first(county),
+            vax = sum(vax),
+            pop = first(pop))
+
+oct_diffdiff <- glm(vax ~ county + after*int,
+                      family = poisson(link = "log"),
+                      offset = log(pop),
+                      #nAGQ = 100,
+                      data = oct_diffdiff_df)
+
+  oct_diffdiff_cov <- vcovHC(oct_diffdiff, type="HC0")
+  oct_diffdiff_RSE <- sqrt(diag(oct_diffdiff_cov))
+    
+  oct_diffdiff_sum <- bind_cols(summary(oct_diffdiff)$coefficients, "RSE" = oct_diffdiff_RSE)
+    
+  diffdiff_oct_index <- which(names(oct_diffdiff$coefficients) == "after:int")
+    
+  oct_diffdiff_irr <- exp(oct_diffdiff_sum$Estimate[diffdiff_oct_index])
+  oct_diffdiff_irr025 <- exp(oct_diffdiff_sum$Estimate[diffdiff_oct_index]+oct_diffdiff_sum$RSE[diffdiff_oct_index]*qnorm(.025))
+  oct_diffdiff_irr975 <- exp(oct_diffdiff_sum$Estimate[diffdiff_oct_index]+oct_diffdiff_sum$RSE[diffdiff_oct_index]*qnorm(.975))
+
+```
+
+```{r oct_diffdiff_adj, eval = F}
+# Possible that this could be driven by the fact that higher HPI quartiles had higher proportions of population vaccinated prior to early March, therefore fewer people eligible to be vaccinated. To adjust for this, include a main effect in the regression for proportion of population unvaxxed by March 8
+
+oct_diffdiff_prevax <- weekly_zip_sum %>% 
+  filter(vemoctile %in% c(2,3)) %>% 
+  filter(date < as.Date("2021-02-08")) %>% 
+  mutate(after = 0,
+         vemo2 = if_else(vemoctile == 2, 1, 3)) %>% 
+  group_by(zip, after) %>% 
+  summarise(int = first(vemo2),
+            county = first(county),
+            vax = sum(vax),
+            pop = first(pop)) %>% 
+  left_join(prevax_propvax, by = "zip")
+
+oct_diffdiff_posvax <- weekly_zip_sum %>% 
+  filter(vemoctile %in% c(2,3)) %>% 
+  filter(date < policy_date) %>% 
+  mutate(after = 1,
+         vemo2 = if_else(vemoctile == 2, 1, 3)) %>% 
+  group_by(zip, after) %>% 
+  summarise(int = first(vemo2),
+            county = first(county),
+            vax = sum(vax),
+            pop = first(pop)) %>% 
+  left_join(prevax_propvax, by = "zip")
+
+oct_diffdiff_df_adj <- oct_diffdiff_df %>% 
+  left_join(bind_rows(oct_diffdiff_prevax,oct_diffdiff_posvax) %>% 
+              dplyr::select(zip,after,prop_unvax),
+            by = c("zip", "after"))
+
+oct_diffdiff_adj <- glm(vax ~ county + prop_unvax + after*int,
+                          family = poisson(link = "log"),
+                          offset = log(pop),
+                          #nAGQ = 100,
+                          data = oct_diffdiff_df_adj)
+
+  oct_diffdiff_adj_cov <- vcovHC(oct_diffdiff_adj, type="HC0")
+  oct_diffdiff_adj_RSE <- sqrt(diag(oct_diffdiff_adj_cov))
+    
+  oct_diffdiff_adj_sum <- bind_cols(summary(oct_diffdiff_adj)$coefficients, "RSE" = oct_diffdiff_adj_RSE)
+    
+  diffdiff_oct_adj_index <- which(names(oct_diffdiff_adj$coefficients) == "after:int")
+    
+  oct_diffdiff_adj_irr <- exp(oct_diffdiff_adj_sum$Estimate[diffdiff_oct_adj_index])
+  oct_diffdiff_adj_irr025 <- exp(oct_diffdiff_adj_sum$Estimate[diffdiff_oct_adj_index]+oct_diffdiff_adj_sum$RSE[diffdiff_oct_adj_index]*qnorm(.025))
+  oct_diffdiff_adj_irr975 <- exp(oct_diffdiff_adj_sum$Estimate[diffdiff_oct_adj_index]+oct_diffdiff_adj_sum$RSE[diffdiff_oct_adj_index]*qnorm(.975))
+
+```
+
+```{r negctrl_sum}
+negctrl_4wk_sum <- diffdiff_vax_qtiles %>% 
+  filter(int_pd == 28) %>% 
+  mutate(irr_sum = paste0(round(irr-1, 3)*100, "% (",
+                          round(irrlo-1, 3)*100, "% - ",
+                          round(irrhi-1, 3)*100, "%)"))
+
+negctrl_248wk_sum <- diffdiff_vax_qtiles %>% 
+  filter(int_pd %in% c(14, 28, 56)) %>% 
+  mutate(irr_sum = paste0(round(irr-1, 3)*100, "% (",
+                          round(irrlo-1, 3)*100, "% - ",
+                          round(irrhi-1, 3)*100, "%)"))
+
+```
+
+
+From the DiD model, the vaccination rate in VEM Q1 zip codes in the four weeks following the equity allocation was estimated to increase by an additional `r round(diffdiff_irr-1,3)*100`% (95%CI: `r round(diffdiff_irr025-1,3)*100`% - `r round(diffdiff_irr975-1,3)*100`%) compared to all non-VEM Q1 zip codes. Adjusting for the proportion of the population unvaccinated led to a slight increase in the effect estimate to `r round(diffdiff_adj_irr-1,3)*100` (95%CI: `r round(diffdiff_adj_irr025-1,3)*100`% - `r round(diffdiff_adj_irr975-1,3)*100`%). Pairwise comparisons among all VEM quartiles in the negative controls analysis suggest there were also significant relative increases in the vaccination rate among VEM Q2 zip codes compared to VEM Q3 and Q4 zip codes (`r negctrl_4wk_sum$irr_sum[negctrl_4wk_sum$qtgt == 2 & negctrl_4wk_sum$qctrl == 3]` and `r negctrl_4wk_sum$irr_sum[negctrl_4wk_sum$qtgt == 2 & negctrl_4wk_sum$qctrl == 4]`, respectively) in the after-policy period. These increases were smaller than the rate increases in VEM Q1 compared to Q3 and Q4, but may suggest te presence of additional factors that influenced vaccination rates at the time the policy was implemented (Supplementary table X). Finally, restricting the analysis to zip codes in the second or third VEM octiles for better exchangeability between treated and untreated groups led to a reduced estimate of `r (round(oct_diffdiff_irr,3)-1)*100`% (95%CI: `r (round(oct_diffdiff_irr025,3)-1)*100`% - `r (round(oct_diffdiff_irr975,3)-1)*100`%).  
+
+
+```{r negctrl_tab, eval = F}
+negctrl_4wk_sum %>% 
+  dplyr::select(qtgt, qctrl, irr_sum) %>% 
+  pivot_wider(names_from = qtgt, values_from = irr_sum) %>% 
+  knitr::kable(row.names = FALSE,
+               col.names = c("Ref Quartile", "VEM Q1", "VEM Q2", "VEM Q3"),
+               caption = "Difference in differences estimates for negative controls sensitivity analysis comparing all combinations of VEM quartiles")
+
+```
+
+
+```{r negctrl_tab2}
+negctrl_248wk_sum %>% 
+  mutate(int_pd = paste0(int_pd/7, " weeks")) %>% 
+  dplyr::select(qtgt, qctrl, int_pd, irr_sum) %>% 
+  pivot_wider(names_from = qtgt, values_from = irr_sum) %>% 
+  knitr::kable(row.names = FALSE,
+               col.names = c("Ref Quartile", "Pre/Post Period", "VEM Q1", "VEM Q2", "VEM Q3"),
+               caption = "Difference in differences estimates for negative controls sensitivity analysis comparing all combinations of VEM quartiles and using different pre/post policy periods for analysis.")
+
+```
+
+
+```{r negctrl_tab_adj, eval=F}
+diffdiff_adj_vax_qtiles %>% 
+  mutate(irr_sum = paste0(round(irr-1, 3)*100, "% (",
+                          round(irrlo-1, 3)*100, "% - ",
+                          round(irrhi-1, 3)*100, "%)")) %>% 
+  dplyr::select(qtgt, qctrl, irr_sum) %>% 
+  pivot_wider(names_from = qtgt, values_from = irr_sum) %>% 
+  knitr::kable(row.names = FALSE,
+               col.names = c("Ref Quartile", "VEM Q1", "VEM Q2", "VEM Q3"),
+               caption = "Difference in differences coefficient for models adjusted for proportion population unvaccinated in each time window comparing all combinations of HPI quartiles")
+
+```
